@@ -1,10 +1,21 @@
 --====================================================================
--- Shining Soul-type 3D ARPG for Roblox -- v2 (single-file server)
+-- Shining Soul-type 3D ARPG for Roblox -- v3 (single-file server)
 -- Paste this whole file into ONE Script in ServerScriptService.
 -- Everything (map, enemies, tools, HUD, shop, waves) is built and
 -- wired up at runtime by this script. No child scripts are used.
 -- v2: damage numbers + hit flash, elite enemies, gear drops
 --     (Armor / Power), DataStore saving.
+-- v3: art pass -- modeled weapons (sword / staff / potion bottle),
+--     slash arc + hit sparks + corpse bursts, modeled enemies
+--     (bouncing slime, goblin, ribbed skeleton, crowned king),
+--     designed town (plaza, paths, stalls, lamps, fence) and
+--     dungeon (checkerboard floor, torches, props), dusk lighting.
+--     Terrain: town is a fenced safe zone; the dungeon has two
+--     healing CAMPFIRES (parts named "Campfire" under the Dungeon
+--     folder), cover pillars / low walls, an entrance corridor
+--     choke point, one LAVA pool (part named "LavaPool") that
+--     burns players, and a raised platform with steps. A single
+--     0.5s zone loop heals at campfires and burns in lava.
 --====================================================================
 
 local Players = game:GetService("Players")
@@ -70,6 +81,20 @@ local function makePart(parent, name, size, cframe, color, material)
 	return p
 end
 
+local function makeWedge(parent, name, size, cframe, color, material)
+	local p = Instance.new("WedgePart")
+	p.Name = name
+	p.Size = size
+	p.CFrame = cframe
+	p.Color = color
+	p.Material = material or Enum.Material.SmoothPlastic
+	p.Anchored = true
+	p.TopSurface = Enum.SurfaceType.Smooth
+	p.BottomSurface = Enum.SurfaceType.Smooth
+	p.Parent = parent
+	return p
+end
+
 local function makeLabel(parent, name, size, position, text, textSize, color)
 	local l = Instance.new("TextLabel")
 	l.Name = name
@@ -105,8 +130,15 @@ end
 --====================================================================
 -- WORLD BUILDING
 --====================================================================
-Lighting.ClockTime = 15.5
-Lighting.Brightness = 2
+-- Dusk mood: low warm sun, warm ambient so shadows stay readable,
+-- light fog for depth. Brightness kept up so the town reads clearly.
+Lighting.ClockTime = 17.8
+Lighting.Brightness = 2.2
+Lighting.Ambient = Color3.fromRGB(150, 110, 90)
+Lighting.OutdoorAmbient = Color3.fromRGB(170, 130, 105)
+Lighting.FogColor = Color3.fromRGB(232, 180, 140)
+Lighting.FogStart = 180
+Lighting.FogEnd = 420
 
 local mapFolder = Instance.new("Folder")
 mapFolder.Name = "ShiningMap"
@@ -134,16 +166,39 @@ local function buildHouse(parent, x, z, wallColor)
 	roof.Material = Enum.Material.Slate
 	roof.Anchored = true
 	roof.Parent = g
-	makePart(g, "Door", Vector3.new(3, 5, 0.4), CFrame.new(x, 2.5, z + 6.1),
-		Color3.fromRGB(90, 60, 35), Enum.Material.Wood)
+	local door = makePart(g, "Door", Vector3.new(3, 5, 0.4), CFrame.new(x, 2.5, z + 6.1),
+		Color3.fromRGB(55, 35, 20), Enum.Material.Wood)
+	makePart(g, "DoorKnob", Vector3.new(0.35, 0.35, 0.2), CFrame.new(x + 1, 2.5, z + 6.35),
+		Color3.fromRGB(255, 200, 80), Enum.Material.Metal).Shape = Enum.PartType.Ball
+	-- warm glowing windows on the front wall (either side of the door)
+	for _, wx in ipairs({-4, 4}) do
+		local win = makePart(g, "Window", Vector3.new(2.2, 2.2, 0.25),
+			CFrame.new(x + wx, 4.6, z + 6.1),
+			Color3.fromRGB(255, 190, 90), Enum.Material.Neon)
+		win.Name = "WindowGlow"
+	end
+	-- chimney with a cap
+	makePart(g, "Chimney", Vector3.new(1.8, 4.5, 1.8), CFrame.new(x + 4.5, 12.5, z - 2),
+		Color3.fromRGB(120, 110, 105), Enum.Material.Brick)
+	makePart(g, "ChimneyCap", Vector3.new(2.4, 0.5, 2.4), CFrame.new(x + 4.5, 14.9, z - 2),
+		Color3.fromRGB(90, 85, 80), Enum.Material.Slate)
+	return door
 end
 
 local function buildTree(parent, x, z)
 	makePart(parent, "Trunk", Vector3.new(1.6, 6, 1.6), CFrame.new(x, 3, z),
 		Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
-	local top = makePart(parent, "Leaves", Vector3.new(7, 7, 7), CFrame.new(x, 9, z),
-		Color3.fromRGB(60, 140, 60), Enum.Material.Grass)
-	top.Shape = Enum.PartType.Ball
+	-- clustered foliage spheres instead of one blob
+	local blobs = {
+		{0, 9.5, 0, 7}, {-2.6, 8, 0.8, 4.6}, {2.6, 8.2, -0.6, 4.8},
+		{0.4, 8.4, 2.6, 4.4}, {-0.8, 11.4, -0.4, 4.2},
+	}
+	for _, b in ipairs(blobs) do
+		local leaf = makePart(parent, "Leaves", Vector3.new(b[4], b[4], b[4]),
+			CFrame.new(x + b[1], b[2], z + b[3]),
+			Color3.fromRGB(55, 135, 58), Enum.Material.Grass)
+		leaf.Shape = Enum.PartType.Ball
+	end
 end
 
 local townSpawnCFrame = CFrame.new(TOWN_CENTER.X, 3, TOWN_CENTER.Z + 18)
@@ -157,10 +212,22 @@ local function buildTown()
 	makePart(town, "Ground", Vector3.new(150, 2, 150),
 		CFrame.new(TOWN_CENTER.X, -1, TOWN_CENTER.Z),
 		Color3.fromRGB(95, 160, 80), Enum.Material.Grass)
-	-- plaza stones
-	makePart(town, "Plaza", Vector3.new(46, 0.4, 46),
-		CFrame.new(TOWN_CENTER.X, 0.2, TOWN_CENTER.Z),
+	-- circular stone plaza under the spawn area
+	local plaza = makePart(town, "Plaza", Vector3.new(0.4, 48, 48),
+		CFrame.new(TOWN_CENTER.X, 0.2, TOWN_CENTER.Z) * CFrame.Angles(0, 0, math.rad(90)),
 		Color3.fromRGB(170, 165, 155), Enum.Material.Cobblestone)
+	plaza.Shape = Enum.PartType.Cylinder
+	local plazaTrim = makePart(town, "PlazaTrim", Vector3.new(0.25, 52, 52),
+		CFrame.new(TOWN_CENTER.X, 0.12, TOWN_CENTER.Z) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(130, 125, 118), Enum.Material.Slate)
+	plazaTrim.Shape = Enum.PartType.Cylinder
+	-- path strips: spawn -> portal (north), spawn -> shops (west)
+	makePart(town, "PathToPortal", Vector3.new(7, 0.3, 52),
+		CFrame.new(TOWN_CENTER.X, 0.15, TOWN_CENTER.Z - 22),
+		Color3.fromRGB(160, 150, 135), Enum.Material.Cobblestone)
+	makePart(town, "PathToShops", Vector3.new(30, 0.3, 6),
+		CFrame.new(TOWN_CENTER.X - 12, 0.15, TOWN_CENTER.Z + 2),
+		Color3.fromRGB(160, 150, 135), Enum.Material.Cobblestone)
 
 	-- spawn pad
 	local spawnPad = Instance.new("SpawnLocation")
@@ -187,6 +254,16 @@ local function buildTown()
 	makePart(town, "FountainPillar", Vector3.new(2, 5, 2),
 		CFrame.new(TOWN_CENTER.X, 2.5, TOWN_CENTER.Z),
 		Color3.fromRGB(150, 150, 150), Enum.Material.Marble)
+	-- glowing orb crowning the fountain
+	local orb = makePart(town, "FountainOrb", Vector3.new(2.2, 2.2, 2.2),
+		CFrame.new(TOWN_CENTER.X, 6.2, TOWN_CENTER.Z),
+		Color3.fromRGB(120, 220, 255), Enum.Material.Neon)
+	orb.Shape = Enum.PartType.Ball
+	local orbLight = Instance.new("PointLight")
+	orbLight.Color = Color3.fromRGB(140, 220, 255)
+	orbLight.Range = 30
+	orbLight.Brightness = 2
+	orbLight.Parent = orb
 
 	-- houses + trees
 	buildHouse(town, -32, TOWN_CENTER.Z + 26, Color3.fromRGB(200, 180, 150))
@@ -199,6 +276,58 @@ local function buildTown()
 	buildTree(town, 52, TOWN_CENTER.Z + 4)
 	buildTree(town, -14, TOWN_CENTER.Z - 34)
 	buildTree(town, 14, TOWN_CENTER.Z - 34)
+	buildTree(town, -58, TOWN_CENTER.Z - 30)
+	buildTree(town, 58, TOWN_CENTER.Z + 30)
+	buildTree(town, 40, TOWN_CENTER.Z + 44)
+
+	-- SAFE ZONE boundary: wooden fence ring with a gate on the portal
+	-- (north) side. The purple portal sits just outside the gate.
+	local fenceMat = Enum.Material.Wood
+	local fenceColor = Color3.fromRGB(110, 80, 50)
+	local function fenceRun(x1, z1, x2, z2)
+		local dx, dz = x2 - x1, z2 - z1
+		local len = math.sqrt(dx * dx + dz * dz)
+		local mid = CFrame.new((x1 + x2) / 2, 0, (z1 + z2) / 2)
+		local cf = CFrame.lookAt(mid.Position, mid.Position + Vector3.new(dx, 0, dz))
+		for _, ry in ipairs({1.1, 2.1}) do
+			makePart(town, "FenceRail", Vector3.new(0.25, 0.35, len),
+				cf * CFrame.new(0, ry, 0), fenceColor, fenceMat)
+		end
+		local posts = math.max(2, math.floor(len / 8) + 1)
+		for i = 0, posts - 1 do
+			local t = (posts == 1) and 0 or i / (posts - 1)
+			makePart(town, "FencePost", Vector3.new(0.7, 3, 0.7),
+				CFrame.new(x1 + dx * t, 1.5, z1 + dz * t), fenceColor, fenceMat)
+		end
+	end
+	local FZ = TOWN_CENTER.Z
+	fenceRun(-46, FZ - 46, -5.5, FZ - 46)  -- north, west of gate
+	fenceRun(5.5, FZ - 46, 46, FZ - 46)    -- north, east of gate
+	fenceRun(-46, FZ + 46, 46, FZ + 46)    -- south
+	fenceRun(-46, FZ - 46, -46, FZ + 46)   -- west
+	fenceRun(46, FZ - 46, 46, FZ + 46)     -- east
+	-- gate posts + lintel
+	for _, gx in ipairs({-5.5, 5.5}) do
+		makePart(town, "GatePost", Vector3.new(1.2, 6, 1.2), CFrame.new(gx, 3, FZ - 46),
+			Color3.fromRGB(90, 62, 38), fenceMat)
+	end
+	makePart(town, "GateBeam", Vector3.new(13.5, 1, 1), CFrame.new(0, 6.2, FZ - 46),
+		Color3.fromRGB(90, 62, 38), fenceMat)
+
+	-- lamp posts: pole + warm neon lamp + real light
+	local lampSpots = { {7, FZ - 24}, {-20, FZ + 6}, {9, FZ + 20} }
+	for _, s in ipairs(lampSpots) do
+		makePart(town, "LampPole", Vector3.new(0.5, 6.5, 0.5), CFrame.new(s[1], 3.25, s[2]),
+			Color3.fromRGB(45, 45, 55), Enum.Material.Metal)
+		local lamp = makePart(town, "LampGlow", Vector3.new(1.5, 1.5, 1.5),
+			CFrame.new(s[1], 7, s[2]), Color3.fromRGB(255, 205, 110), Enum.Material.Neon)
+		lamp.Shape = Enum.PartType.Ball
+		local ll = Instance.new("PointLight")
+		ll.Color = Color3.fromRGB(255, 195, 110)
+		ll.Range = 26
+		ll.Brightness = 2
+		ll.Parent = lamp
+	end
 
 	return town
 end
@@ -211,33 +340,92 @@ local function buildMerchant(town)
 	local stand = Instance.new("Folder")
 	stand.Name = "Merchant"
 	stand.Parent = town
-	local mx, mz = -10, TOWN_CENTER.Z - 6
 
-	makePart(stand, "Counter", Vector3.new(12, 3, 3), CFrame.new(mx, 1.5, mz),
-		Color3.fromRGB(120, 85, 50), Enum.Material.Wood)
-	makePart(stand, "Awning", Vector3.new(14, 0.4, 6), CFrame.new(mx, 7, mz),
-		Color3.fromRGB(200, 60, 60), Enum.Material.Fabric)
-	-- simple merchant dummy (anchored decorative parts)
-	makePart(stand, "MerchantBody", Vector3.new(2.4, 3, 1.2), CFrame.new(mx, 4.5, mz - 2.5),
+	-- One market stall: 4 posts, counter, sloped two-tone awning,
+	-- hanging sign with SurfaceGui text. Front faces +Z (the plaza).
+	local function buildStall(cx, cz, awningColor, stripeColor, signText)
+		local g = Instance.new("Folder")
+		g.Name = "Stall"
+		g.Parent = stand
+		for _, ox in ipairs({-5.5, 5.5}) do
+			for _, oz in ipairs({-2.5, 3}) do
+				makePart(g, "Post", Vector3.new(0.6, 8, 0.6),
+					CFrame.new(cx + ox, 4, cz + oz),
+					Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+			end
+		end
+		makePart(g, "Counter", Vector3.new(12, 3, 2.6), CFrame.new(cx, 1.5, cz + 2.6),
+			Color3.fromRGB(120, 85, 50), Enum.Material.Wood)
+		makePart(g, "CounterTop", Vector3.new(12.6, 0.35, 3.2), CFrame.new(cx, 3.15, cz + 2.6),
+			Color3.fromRGB(150, 110, 70), Enum.Material.Wood)
+		-- awning: main sloped slab + a contrasting center stripe
+		local tilt = CFrame.Angles(math.rad(-14), 0, 0)
+		makePart(g, "Awning", Vector3.new(13.5, 0.35, 7.5),
+			CFrame.new(cx, 8.6, cz + 0.2) * tilt, awningColor, Enum.Material.Fabric)
+		makePart(g, "AwningStripe", Vector3.new(4, 0.4, 7.6),
+			CFrame.new(cx, 8.65, cz + 0.2) * tilt, stripeColor, Enum.Material.Fabric)
+		-- hanging sign
+		local sign = makePart(g, "Sign", Vector3.new(9, 2.2, 0.3), CFrame.new(cx, 6.4, cz + 3.2),
+			Color3.fromRGB(80, 55, 30), Enum.Material.Wood)
+		local gui = Instance.new("SurfaceGui")
+		gui.Face = Enum.NormalId.Front
+		gui.Parent = sign
+		local tl = makeLabel(gui, "SignText", UDim2.fromScale(1, 1), UDim2.fromScale(0, 0),
+			signText, 30, Color3.fromRGB(255, 230, 150))
+		tl.TextXAlignment = Enum.TextXAlignment.Center
+		return g
+	end
+
+	-- ITEM SHOP (potions) -- red/cream awning
+	local itemStall = buildStall(-19, TOWN_CENTER.Z - 6,
+		Color3.fromRGB(200, 60, 60), Color3.fromRGB(245, 235, 210), "ITEM SHOP")
+	makePart(itemStall, "MerchantBody", Vector3.new(2.4, 3, 1.2),
+		CFrame.new(-19, 4.5, TOWN_CENTER.Z - 8.5),
 		Color3.fromRGB(60, 90, 200), Enum.Material.SmoothPlastic)
-	local head = makePart(stand, "MerchantHead", Vector3.new(1.8, 1.8, 1.8),
-		CFrame.new(mx, 7, mz - 2.5), Color3.fromRGB(240, 200, 160), Enum.Material.SmoothPlastic)
-	head.Shape = Enum.PartType.Ball
+	local iHead = makePart(itemStall, "MerchantHead", Vector3.new(1.8, 1.8, 1.8),
+		CFrame.new(-19, 7, TOWN_CENTER.Z - 8.5), Color3.fromRGB(240, 200, 160),
+		Enum.Material.SmoothPlastic)
+	iHead.Shape = Enum.PartType.Ball
+	-- potion bottles on display
+	for i, bx in ipairs({-22, -19, -16}) do
+		local bottle = makePart(itemStall, "DisplayBottle", Vector3.new(1.2, 0.8, 0.8),
+			CFrame.new(bx, 3.9, TOWN_CENTER.Z - 3.4) * CFrame.Angles(0, 0, math.rad(90)),
+			(i == 2) and Color3.fromRGB(90, 255, 140) or Color3.fromRGB(255, 80, 110),
+			Enum.Material.Neon)
+		bottle.Shape = Enum.PartType.Cylinder
+	end
 
+	-- BLACKSMITH (sword upgrades) -- charcoal/orange awning + anvil
+	local smithStall = buildStall(1, TOWN_CENTER.Z - 6,
+		Color3.fromRGB(70, 70, 80), Color3.fromRGB(255, 140, 50), "BLACKSMITH")
+	makePart(smithStall, "SmithBody", Vector3.new(2.4, 3, 1.2),
+		CFrame.new(1, 4.5, TOWN_CENTER.Z - 8.5),
+		Color3.fromRGB(120, 60, 40), Enum.Material.SmoothPlastic)
+	local sHead = makePart(smithStall, "SmithHead", Vector3.new(1.8, 1.8, 1.8),
+		CFrame.new(1, 7, TOWN_CENTER.Z - 8.5), Color3.fromRGB(225, 180, 140),
+		Enum.Material.SmoothPlastic)
+	sHead.Shape = Enum.PartType.Ball
+	makePart(smithStall, "AnvilBase", Vector3.new(1.6, 1.4, 1.6),
+		CFrame.new(4.5, 0.7, TOWN_CENTER.Z - 4.5),
+		Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+	makePart(smithStall, "Anvil", Vector3.new(2.6, 1, 1.1),
+		CFrame.new(4.5, 1.9, TOWN_CENTER.Z - 4.5),
+		Color3.fromRGB(70, 72, 80), Enum.Material.Metal)
+
+	-- Shop prompt anchor parts (prompts wired up later in setupShop)
 	potionStandPart = makePart(stand, "PotionStand", Vector3.new(3, 2, 3),
-		CFrame.new(mx - 4, 1, mz + 4), Color3.fromRGB(220, 60, 80), Enum.Material.SmoothPlastic)
+		CFrame.new(-19, 1, TOWN_CENTER.Z - 1), Color3.fromRGB(220, 60, 80), Enum.Material.SmoothPlastic)
 	upgradeStandPart = makePart(stand, "UpgradeStand", Vector3.new(3, 2, 3),
-		CFrame.new(mx + 4, 1, mz + 4), Color3.fromRGB(255, 190, 60), Enum.Material.SmoothPlastic)
-
-	local sign = makePart(stand, "Sign", Vector3.new(10, 2.4, 0.3), CFrame.new(mx, 9.5, mz),
-		Color3.fromRGB(90, 60, 35), Enum.Material.Wood)
-	local gui = Instance.new("SurfaceGui")
-	gui.Face = Enum.NormalId.Front
-	gui.Parent = sign
-	local tl = makeLabel(gui, "SignText", UDim2.fromScale(1, 1), UDim2.fromScale(0, 0),
-		"SHOP", 28, Color3.fromRGB(255, 230, 150))
-	tl.TextXAlignment = Enum.TextXAlignment.Center
+		CFrame.new(1, 1, TOWN_CENTER.Z - 1), Color3.fromRGB(255, 190, 60), Enum.Material.SmoothPlastic)
 end
+
+-- Terrain registry used by the zone loop further below: campfire
+-- center positions (heal) and the lava pool bounds (burn). The
+-- matching visual parts are named "Campfire" / "LavaPool" and live
+-- in the Dungeon folder.
+local campfirePositions = {}
+local LAVA_REL = Vector3.new(40, 0, -30) -- relative to DUNGEON_CENTER
+local LAVA_HALF = 5
 
 local function buildDungeon()
 	local dg = Instance.new("Folder")
@@ -247,8 +435,19 @@ local function buildDungeon()
 	local wallColor = Color3.fromRGB(90, 90, 100)
 	local wallMat = Enum.Material.Slate
 
+	-- base slab + checkerboard dark-stone tiles on top
 	makePart(dg, "Floor", Vector3.new(DUNGEON_HALF_X * 2 + 10, 2, DUNGEON_HALF_Z * 2 + 10),
-		CFrame.new(cx, -1, cz), Color3.fromRGB(70, 68, 78), Enum.Material.Cobblestone)
+		CFrame.new(cx, -1, cz), Color3.fromRGB(30, 29, 38), Enum.Material.Slate)
+	local tileA = Color3.fromRGB(56, 54, 66)
+	local tileB = Color3.fromRGB(40, 39, 49)
+	for ix = 0, 11 do
+		for iz = 0, 9 do
+			local tile = makePart(dg, "FloorTile", Vector3.new(9.9, 0.25, 9.9),
+				CFrame.new(cx - 55 + ix * 10, 0.13, cz - 45 + iz * 10),
+				((ix + iz) % 2 == 0) and tileA or tileB, Enum.Material.Slate)
+			tile.TopSurface = Enum.SurfaceType.Smooth
+		end
+	end
 	-- walls (height 12)
 	makePart(dg, "WallN", Vector3.new(DUNGEON_HALF_X * 2 + 10, 12, 2),
 		CFrame.new(cx, 6, cz - DUNGEON_HALF_Z - 1), wallColor, wallMat)
@@ -258,14 +457,30 @@ local function buildDungeon()
 		CFrame.new(cx - DUNGEON_HALF_X - 1, 6, cz), wallColor, wallMat)
 	makePart(dg, "WallE", Vector3.new(2, 12, DUNGEON_HALF_Z * 2 + 10),
 		CFrame.new(cx + DUNGEON_HALF_X + 1, 6, cz), wallColor, wallMat)
-	-- pillars
+	-- decorative columns hugging the walls
+	for _, px in ipairs({-44, -22, 22, 44}) do
+		for _, pz in ipairs({-DUNGEON_HALF_Z + 2, DUNGEON_HALF_Z - 2}) do
+			makePart(dg, "WallColumn", Vector3.new(3.4, 12, 3.4),
+				CFrame.new(cx + px, 6, cz + pz), wallColor, wallMat)
+		end
+	end
+	for _, pz in ipairs({-24, 0, 24}) do
+		for _, px in ipairs({-DUNGEON_HALF_X + 2, DUNGEON_HALF_X - 2}) do
+			makePart(dg, "WallColumn", Vector3.new(3.4, 12, 3.4),
+				CFrame.new(cx + px, 6, cz + pz), wallColor, wallMat)
+		end
+	end
+	-- interior pillars (existing set doubles as cover)
 	for _, px in ipairs({-30, 0, 30}) do
 		for _, pz in ipairs({-25, 15}) do
 			makePart(dg, "Pillar", Vector3.new(4, 11, 4),
 				CFrame.new(cx + px, 5.5, cz + pz), wallColor, wallMat)
+			makePart(dg, "PillarCap", Vector3.new(5, 1, 5),
+				CFrame.new(cx + px, 11.2, cz + pz),
+				Color3.fromRGB(110, 110, 122), wallMat)
 		end
 	end
-	-- torches with real light
+	-- torches with real light + particle flames
 	local torchSpots = {
 		{-DUNGEON_HALF_X + 3, -DUNGEON_HALF_Z + 3}, {DUNGEON_HALF_X - 3, -DUNGEON_HALF_Z + 3},
 		{-DUNGEON_HALF_X + 3, DUNGEON_HALF_Z - 3}, {DUNGEON_HALF_X - 3, DUNGEON_HALF_Z - 3},
@@ -283,7 +498,168 @@ local function buildDungeon()
 		light.Range = 26
 		light.Brightness = 2
 		light.Parent = flame
+		local em = Instance.new("ParticleEmitter")
+		em.Texture = "rbxasset://textures/particles/fire_main.dds"
+		em.Rate = 14
+		em.Lifetime = NumberRange.new(0.35, 0.7)
+		em.Speed = NumberRange.new(1.5, 3)
+		em.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.9),
+			NumberSequenceKeypoint.new(1, 0) })
+		em.Color = ColorSequence.new(Color3.fromRGB(255, 170, 70))
+		em.LightEmission = 1
+		em.Parent = flame
 	end
+
+	-- ENTRANCE ARCH over the return portal (south side)
+	for _, ax in ipairs({-5.5, 5.5}) do
+		makePart(dg, "ArchPost", Vector3.new(1.6, 11, 1.6), CFrame.new(cx + ax, 5.5, cz + 38),
+			wallColor, wallMat)
+	end
+	makePart(dg, "ArchBeam", Vector3.new(13, 1.8, 2), CFrame.new(cx, 11.4, cz + 38),
+		Color3.fromRGB(110, 110, 122), wallMat)
+
+	-- CHOKE POINT: entrance corridor. Players teleport in at
+	-- (0, ~, cz+36), inside this corridor; it opens at cz+28.
+	for _, wx in ipairs({-5.5, 5.5}) do
+		makePart(dg, "CorridorWall", Vector3.new(1.5, 7, 13), CFrame.new(cx + wx, 3.5, cz + 34),
+			wallColor, wallMat)
+		makePart(dg, "CorridorCap", Vector3.new(2.4, 0.8, 13), CFrame.new(cx + wx, 7.4, cz + 34),
+			Color3.fromRGB(110, 110, 122), wallMat)
+	end
+
+	-- COVER / KITING terrain inside the arena (kept clear of the
+	-- corridor, the boss spot at cz-10 and both campfires)
+	makePart(dg, "CoverPillar", Vector3.new(3.5, 10, 3.5), CFrame.new(cx + 15, 5, cz - 18),
+		wallColor, wallMat)
+	makePart(dg, "CoverPillar", Vector3.new(3.5, 10, 3.5), CFrame.new(cx - 16, 5, cz + 2),
+		wallColor, wallMat)
+	makePart(dg, "LowWall", Vector3.new(11, 3, 1.6), CFrame.new(cx + 24, 1.5, cz + 8),
+		Color3.fromRGB(100, 100, 112), wallMat)
+	local lw = makePart(dg, "LowWall", Vector3.new(11, 3, 1.6), CFrame.new(cx - 26, 1.5, cz - 24),
+		Color3.fromRGB(100, 100, 112), wallMat)
+	lw.CFrame = CFrame.new(cx - 26, 1.5, cz - 24) * CFrame.Angles(0, math.rad(90), 0)
+
+	-- RAISED PLATFORM (vantage spot) at the west edge + steps up
+	makePart(dg, "Platform", Vector3.new(14, 4, 14), CFrame.new(cx - 46, 2, cz + 14),
+		Color3.fromRGB(80, 78, 90), wallMat)
+	makePart(dg, "PlatformTop", Vector3.new(15, 0.4, 15), CFrame.new(cx - 46, 4.2, cz + 14),
+		Color3.fromRGB(100, 98, 110), wallMat)
+	makePart(dg, "Step1", Vector3.new(3, 3, 10), CFrame.new(cx - 37.5, 1.5, cz + 14),
+		Color3.fromRGB(88, 86, 98), wallMat)
+	makePart(dg, "Step2", Vector3.new(3, 2, 10), CFrame.new(cx - 34.5, 1, cz + 14),
+		Color3.fromRGB(88, 86, 98), wallMat)
+	makePart(dg, "Step3", Vector3.new(3, 1, 10), CFrame.new(cx - 31.5, 0.5, cz + 14),
+		Color3.fromRGB(88, 86, 98), wallMat)
+
+	-- CAMPFIRES (safe spots): stone ring + logs + neon flame + light,
+	-- flat ring marker shows the heal radius. One by the entrance,
+	-- one mid-arena on the west side.
+	local function buildCampfire(fx, fz)
+		local g = Instance.new("Folder")
+		g.Name = "CampfireSite"
+		g.Parent = dg
+		local ring = makePart(g, "CampfireRing", Vector3.new(0.3, 14.6, 14.6),
+			CFrame.new(fx, 0.32, fz) * CFrame.Angles(0, 0, math.rad(90)),
+			Color3.fromRGB(90, 255, 170), Enum.Material.Neon)
+		ring.Shape = Enum.PartType.Cylinder
+		ring.Transparency = 0.78
+		ring.CanCollide = false
+		for i = 1, 8 do
+			local a = (i / 8) * math.pi * 2
+			local stone = makePart(g, "RingStone", Vector3.new(1.1, 0.9, 1.1),
+				CFrame.new(fx + math.cos(a) * 2.6, 0.45, fz + math.sin(a) * 2.6),
+				Color3.fromRGB(120, 118, 112), Enum.Material.Slate)
+			stone.Shape = Enum.PartType.Ball
+		end
+		for i = 1, 3 do
+			local a = (i / 3) * math.pi * 2
+			local log = makePart(g, "Log", Vector3.new(3.2, 0.55, 0.55),
+				CFrame.new(fx, 0.5, fz) * CFrame.Angles(math.rad(65), a, 0),
+				Color3.fromRGB(95, 62, 35), Enum.Material.Wood)
+			log.Shape = Enum.PartType.Cylinder
+		end
+		local flame = makePart(g, "Campfire", Vector3.new(1.8, 2.4, 1.8),
+			CFrame.new(fx, 1.5, fz), Color3.fromRGB(255, 150, 60), Enum.Material.Neon)
+		flame.Shape = Enum.PartType.Ball
+		flame.CanCollide = false
+		local fl = Instance.new("PointLight")
+		fl.Color = Color3.fromRGB(255, 170, 90)
+		fl.Range = 24
+		fl.Brightness = 2.5
+		fl.Parent = flame
+		local em = Instance.new("ParticleEmitter")
+		em.Texture = "rbxasset://textures/particles/fire_main.dds"
+		em.Rate = 20
+		em.Lifetime = NumberRange.new(0.4, 0.9)
+		em.Speed = NumberRange.new(2, 4)
+		em.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.1),
+			NumberSequenceKeypoint.new(1, 0) })
+		em.Color = ColorSequence.new(Color3.fromRGB(255, 180, 80))
+		em.LightEmission = 1
+		em.Parent = flame
+		table.insert(campfirePositions, Vector3.new(fx, 0, fz))
+	end
+	buildCampfire(cx + 13, cz + 30)   -- just outside the entrance corridor
+	buildCampfire(cx - 38, cz - 8)    -- mid-arena, west side
+
+	-- LAVA POOL (danger zone) in the south-east corner: rim + the
+	-- glowing pool itself. Named "LavaPool"; the zone loop burns
+	-- players standing inside LAVA_REL +/- LAVA_HALF.
+	local lavaX, lavaZ = cx + LAVA_REL.X, cz + LAVA_REL.Z
+	makePart(dg, "LavaRim", Vector3.new(12.5, 0.6, 12.5), CFrame.new(lavaX, 0.3, lavaZ),
+		Color3.fromRGB(45, 40, 42), Enum.Material.Slate)
+	local lava = makePart(dg, "LavaPool", Vector3.new(10, 0.5, 10), CFrame.new(lavaX, 0.45, lavaZ),
+		Color3.fromRGB(255, 90, 30), Enum.Material.Neon)
+	lava.CanCollide = false
+	local lavaLight = Instance.new("PointLight")
+	lavaLight.Color = Color3.fromRGB(255, 120, 50)
+	lavaLight.Range = 22
+	lavaLight.Brightness = 2
+	lavaLight.Parent = lava
+	local lavaEm = Instance.new("ParticleEmitter")
+	lavaEm.Texture = "rbxasset://textures/particles/fire_main.dds"
+	lavaEm.Rate = 8
+	lavaEm.Lifetime = NumberRange.new(0.6, 1.2)
+	lavaEm.Speed = NumberRange.new(1, 2.5)
+	lavaEm.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.8),
+		NumberSequenceKeypoint.new(1, 0) })
+	lavaEm.Color = ColorSequence.new(Color3.fromRGB(255, 140, 60))
+	lavaEm.LightEmission = 1
+	lavaEm.Parent = lava
+
+	-- scattered props, kept out of the combat center
+	local function rock(rx, rz, s)
+		local r = makePart(dg, "Rock", Vector3.new(s, s * 0.7, s * 0.85),
+			CFrame.new(cx + rx, s * 0.3, cz + rz) * CFrame.Angles(0, math.rad(rx * 7), 0),
+			Color3.fromRGB(105, 103, 110), Enum.Material.Slate)
+		r.Shape = Enum.PartType.Ball
+	end
+	rock(-48, -34, 3.4)
+	rock(48, 22, 2.8)
+	rock(-14, 37, 2.2)
+	rock(30, 36, 2.6)
+	local function bonePile(bx, bz)
+		for i = 1, 3 do
+			local bone = makePart(dg, "Bone", Vector3.new(0.35, 0.35, 2.6),
+				CFrame.new(cx + bx, 0.45, cz + bz) * CFrame.Angles(0, math.rad(i * 55), 0),
+				Color3.fromRGB(232, 228, 215), Enum.Material.SmoothPlastic)
+			bone.Shape = Enum.PartType.Cylinder
+		end
+	end
+	bonePile(28, -36)
+	bonePile(-32, 27)
+	local function crate(px, pz, py)
+		makePart(dg, "Crate", Vector3.new(2.6, 2.6, 2.6), CFrame.new(cx + px, py, cz + pz),
+			Color3.fromRGB(130, 95, 55), Enum.Material.Wood)
+	end
+	crate(50, -6, 1.3)
+	crate(50, -6, 3.9)
+	crate(47.5, -3.5, 1.3)
+	local barrel = makePart(dg, "Barrel", Vector3.new(3.2, 2.2, 2.2),
+		CFrame.new(cx - 50, 1.6, cz - 16) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(115, 80, 45), Enum.Material.Wood)
+	barrel.Shape = Enum.PartType.Cylinder
+
 	return dg
 end
 
@@ -297,12 +673,47 @@ local function buildPortals(town, dg)
 		Color3.fromRGB(160, 60, 255), Enum.Material.Neon)
 	portalToDungeon.CanCollide = false
 	portalToDungeon.Transparency = 0.25
+	-- stone frame around the dungeon portal: 2 pillars + top beam
+	local pz = TOWN_CENTER.Z - 48
+	for _, px in ipairs({-4.6, 4.6}) do
+		makePart(town, "PortalPillar", Vector3.new(1.8, 11, 1.8), CFrame.new(px, 5.5, pz),
+			Color3.fromRGB(105, 100, 115), Enum.Material.Slate)
+		local cap = makePart(town, "PortalPillarCap", Vector3.new(2.4, 2.4, 2.4),
+			CFrame.new(px, 11.6, pz), Color3.fromRGB(170, 90, 255), Enum.Material.Neon)
+		cap.Shape = Enum.PartType.Ball
+	end
+	makePart(town, "PortalBeam", Vector3.new(11.5, 1.6, 1.8), CFrame.new(0, 10.6, pz),
+		Color3.fromRGB(105, 100, 115), Enum.Material.Slate)
+	local pLight = Instance.new("PointLight")
+	pLight.Color = Color3.fromRGB(180, 100, 255)
+	pLight.Range = 28
+	pLight.Brightness = 2.5
+	pLight.Parent = portalToDungeon
+	local sparkles = Instance.new("ParticleEmitter")
+	sparkles.Texture = "rbxasset://textures/particles/sparkles_main.dds"
+	sparkles.Rate = 24
+	sparkles.Lifetime = NumberRange.new(0.8, 1.6)
+	sparkles.Speed = NumberRange.new(0.5, 1.5)
+	sparkles.SpreadAngle = Vector2.new(180, 180)
+	sparkles.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 0.55),
+		NumberSequenceKeypoint.new(1, 0) })
+	sparkles.Color = ColorSequence.new(Color3.fromRGB(200, 130, 255))
+	sparkles.LightEmission = 1
+	sparkles.Parent = portalToDungeon
 
 	portalToTown = makePart(dg, "PortalToTown", Vector3.new(7, 9, 1),
 		CFrame.new(DUNGEON_CENTER.X, 4.5, DUNGEON_CENTER.Z + DUNGEON_HALF_Z - 3),
 		Color3.fromRGB(60, 200, 255), Enum.Material.Neon)
 	portalToTown.CanCollide = false
 	portalToTown.Transparency = 0.25
+	local tLight = Instance.new("PointLight")
+	tLight.Color = Color3.fromRGB(110, 210, 255)
+	tLight.Range = 24
+	tLight.Brightness = 2
+	tLight.Parent = portalToTown
+	local tSparkles = sparkles:Clone()
+	tSparkles.Color = ColorSequence.new(Color3.fromRGB(140, 220, 255))
+	tSparkles.Parent = portalToTown
 end
 
 local townFolder = buildTown()
@@ -461,53 +872,139 @@ local function weldTo(part, root)
 	w.Parent = part
 end
 
+-- Enemy visuals. All parts are welded to the HumanoidRootPart with
+-- WeldConstraints (see weldTo); the face looks toward -Z. Returns the
+-- main body part (the slime's body is squash-animated by the AI loop).
 local function buildEnemyVisual(model, root, kind, def)
 	local s = def.scale
-	local body = Instance.new("Part")
-	body.Name = "Body"
-	body.Size = Vector3.new(2.2 * s, 2.6 * s, 1.2 * s)
-	body.Color = def.bodyColor
-	body.Material = Enum.Material.SmoothPlastic
-	body.CFrame = root.CFrame * CFrame.new(0, 0.4 * s, 0)
-	body.Parent = model
-	weldTo(body, root)
+	local function add(name, size, offset, color, material, shape, extraCFrame)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.Color = color
+		p.Material = material or Enum.Material.SmoothPlastic
+		if shape then p.Shape = shape end
+		p.CFrame = root.CFrame * CFrame.new(offset) * (extraCFrame or CFrame.new())
+		p.Parent = model
+		weldTo(p, root)
+		return p
+	end
+	local boneWhite = def.bodyColor
+	local boneHead = def.headColor
+
 	if kind == "Slime" then
-		body.Shape = Enum.PartType.Ball
-		body.Size = Vector3.new(3 * s, 2.4 * s, 3 * s)
+		local body = add("Body", Vector3.new(3 * s, 2.4 * s, 3 * s),
+			Vector3.new(0, 0.3 * s, 0), def.bodyColor, nil, Enum.PartType.Ball)
 		body.Transparency = 0.2
+		-- glowing inner core
+		local core = add("Core", Vector3.new(1.35 * s, 1.35 * s, 1.35 * s),
+			Vector3.new(0, 0.3 * s, 0), Color3.fromRGB(190, 255, 170),
+			Enum.Material.Neon, Enum.PartType.Ball)
+		core.Transparency = 0.15
+		-- eyes with white highlights
+		for _, ex in ipairs({-0.55, 0.55}) do
+			add("Eye", Vector3.new(0.36 * s, 0.44 * s, 0.2),
+				Vector3.new(ex * s, 0.8 * s, -1.38 * s),
+				Color3.fromRGB(15, 15, 15), Enum.Material.Neon, Enum.PartType.Ball)
+			add("EyeShine", Vector3.new(0.13 * s, 0.13 * s, 0.08),
+				Vector3.new((ex - 0.1) * s, 0.95 * s, -1.52 * s),
+				Color3.fromRGB(255, 255, 255), Enum.Material.Neon, Enum.PartType.Ball)
+		end
+		return body
 	end
-	local head = Instance.new("Part")
-	head.Name = "HeadVisual"
-	head.Size = Vector3.new(1.6 * s, 1.4 * s, 1.4 * s)
-	head.Color = def.headColor
-	head.Material = Enum.Material.SmoothPlastic
-	head.CFrame = root.CFrame * CFrame.new(0, (2.4 * s), 0)
-	head.Parent = model
-	if kind ~= "Slime" then
-		weldTo(head, root)
-	else
-		head:Destroy() -- slime is just a blob
+
+	if kind == "Goblin" then
+		for _, lx in ipairs({-0.5, 0.5}) do
+			add("Leg", Vector3.new(0.55 * s, 1.1 * s, 0.55 * s),
+				Vector3.new(lx * s, -1.05 * s, 0), def.bodyColor)
+		end
+		local body = add("Body", Vector3.new(2.2 * s, 2.2 * s, 1.2 * s),
+			Vector3.new(0, 0.55 * s, 0), def.bodyColor)
+		-- dark belt / loincloth band
+		add("Belt", Vector3.new(2.35 * s, 0.55 * s, 1.35 * s),
+			Vector3.new(0, -0.2 * s, 0), Color3.fromRGB(70, 48, 30), Enum.Material.Leather)
+		for _, ax in ipairs({-1.35, 1.35}) do
+			add("Arm", Vector3.new(0.5 * s, 1.9 * s, 0.5 * s),
+				Vector3.new(ax * s, 0.45 * s, 0), def.bodyColor, nil, nil,
+				CFrame.Angles(0, 0, math.rad(ax > 0 and -14 or 14)))
+		end
+		add("HeadVisual", Vector3.new(1.55 * s, 1.4 * s, 1.4 * s),
+			Vector3.new(0, 2.35 * s, 0), def.headColor, nil, Enum.PartType.Ball)
+		-- long pointy ears (wedges angled up/out)
+		for _, ex in ipairs({-1, 1}) do
+			local ear = Instance.new("WedgePart")
+			ear.Name = "Ear"
+			ear.Size = Vector3.new(1.5 * s, 0.55 * s, 0.3 * s)
+			ear.Color = def.headColor
+			ear.Material = Enum.Material.SmoothPlastic
+			ear.CFrame = root.CFrame * CFrame.new(ex * 1.25 * s, 2.7 * s, 0)
+				* CFrame.Angles(0, ex > 0 and math.rad(180) or 0, math.rad(ex * 18))
+			ear.Parent = model
+			weldTo(ear, root)
+		end
+		for _, ex in ipairs({-0.35, 0.35}) do
+			add("Eye", Vector3.new(0.27 * s, 0.27 * s, 0.12),
+				Vector3.new(ex * s, 2.45 * s, -0.68 * s),
+				Color3.fromRGB(255, 220, 60), Enum.Material.Neon, Enum.PartType.Ball)
+		end
+		return body
 	end
-	-- eyes (front = -Z of root look direction is +Z for models; use -Z face)
-	for _, ex in ipairs({-0.4, 0.4}) do
-		local eye = Instance.new("Part")
-		eye.Name = "Eye"
-		eye.Size = Vector3.new(0.28 * s, 0.28 * s, 0.1)
-		eye.Color = Color3.fromRGB(20, 20, 20)
-		eye.Material = Enum.Material.Neon
-		local yOff = (kind == "Slime") and (0.5 * s) or (2.5 * s)
-		local zOff = (kind == "Slime") and (-1.45 * s) or (-0.75 * s)
-		eye.CFrame = root.CFrame * CFrame.new(ex * s, yOff, zOff)
-		eye.Parent = model
-		weldTo(eye, root)
+
+	-- Skeleton + SkeletonKing share the bone build
+	for _, lx in ipairs({-0.5, 0.5}) do
+		add("Leg", Vector3.new(0.45 * s, 1.7 * s, 0.45 * s),
+			Vector3.new(lx * s, -1.15 * s, 0), boneWhite)
 	end
+	local torso = add("Body", Vector3.new(2 * s, 2.2 * s, 1 * s),
+		Vector3.new(0, 0.55 * s, 0), boneWhite)
+	-- rib bars across the chest (front = -Z)
+	for i = 0, 2 do
+		add("Rib", Vector3.new(2.15 * s, 0.3 * s, 0.22 * s),
+			Vector3.new(0, (0.05 + i * 0.55) * s, -0.55 * s),
+			Color3.fromRGB(205, 205, 195))
+	end
+	for _, ax in ipairs({-1.25, 1.25}) do
+		add("Arm", Vector3.new(0.4 * s, 2 * s, 0.4 * s),
+			Vector3.new(ax * s, 0.45 * s, 0), boneWhite, nil, nil,
+			CFrame.Angles(0, 0, math.rad(ax > 0 and -8 or 8)))
+	end
+	-- skull with black eye sockets
+	add("HeadVisual", Vector3.new(1.6 * s, 1.5 * s, 1.5 * s),
+		Vector3.new(0, 2.4 * s, 0), boneHead, nil, Enum.PartType.Ball)
+	add("Jaw", Vector3.new(1.05 * s, 0.45 * s, 1.05 * s),
+		Vector3.new(0, 1.78 * s, -0.08 * s), boneHead)
+	for _, ex in ipairs({-0.38, 0.38}) do
+		add("EyeSocket", Vector3.new(0.36 * s, 0.42 * s, 0.2),
+			Vector3.new(ex * s, 2.5 * s, -0.68 * s),
+			Color3.fromRGB(8, 8, 10), nil, Enum.PartType.Ball)
+	end
+	if kind == "SkeletonKing" then
+		-- gold crown: band + four spikes
+		local crownY = 3.3 * s
+		local band = add("Crown", Vector3.new(0.6 * s, 2.5 * s, 2.5 * s),
+			Vector3.new(0, crownY, 0), Color3.fromRGB(255, 200, 60),
+			Enum.Material.Metal, Enum.PartType.Cylinder,
+			CFrame.Angles(0, 0, math.rad(90)))
+		band.Name = "CrownBand"
+		for i = 0, 3 do
+			local a = i * math.pi / 2 + math.pi / 4
+			add("CrownSpike", Vector3.new(0.34 * s, 0.8 * s, 0.34 * s),
+				Vector3.new(math.cos(a) * 1.05 * s, (crownY + 0.55 * s), math.sin(a) * 1.05 * s),
+				Color3.fromRGB(255, 200, 60), Enum.Material.Metal)
+		end
+		-- red cape hanging down the back (+Z)
+		add("Cape", Vector3.new(2.5 * s, 3.6 * s, 0.25 * s),
+			Vector3.new(0, 0.35 * s, 0.78 * s), Color3.fromRGB(170, 30, 40),
+			Enum.Material.Fabric, nil, CFrame.Angles(math.rad(7), 0, 0))
+	end
+	return torso
 end
 
-local function makeHealthBar(model, root, displayName)
+local function makeHealthBar(model, root, displayName, scale)
 	local gui = Instance.new("BillboardGui")
 	gui.Name = "HealthBar"
 	gui.Size = UDim2.new(4, 0, 0.6, 0)
-	gui.StudsOffset = Vector3.new(0, 3.6, 0)
+	gui.StudsOffset = Vector3.new(0, 2.4 * (scale or 1) + 1.5, 0)
 	gui.AlwaysOnTop = true
 	gui.Parent = root
 	local bg = Instance.new("Frame")
@@ -681,6 +1178,31 @@ local function flashEnemy(model, data)
 	end)
 end
 
+-- Small neon spark burst at the hit point (~0.3s, then gone)
+local function spawnSparks(position)
+	for _ = 1, 6 do
+		local sp = Instance.new("Part")
+		sp.Name = "HitSpark"
+		sp.Size = Vector3.new(0.28, 0.28, 0.28)
+		sp.Color = Color3.fromRGB(255, 225, 130)
+		sp.Material = Enum.Material.Neon
+		sp.CanCollide = false
+		sp.Position = position
+		sp.Parent = Workspace
+		sp.AssemblyLinearVelocity = Vector3.new(
+			math.random(-14, 14), math.random(4, 16), math.random(-14, 14))
+		Debris:AddItem(sp, 0.35)
+		task.spawn(function()
+			local t0 = os.clock()
+			while sp.Parent and os.clock() - t0 < 0.3 do
+				sp.Transparency = (os.clock() - t0) / 0.3
+				task.wait(0.03)
+			end
+			if sp.Parent then sp:Destroy() end
+		end)
+	end
+end
+
 local function damageEnemy(model, amount, attacker, knockbackDir)
 	local data = enemies[model]
 	if not data then return end
@@ -691,6 +1213,7 @@ local function damageEnemy(model, amount, attacker, knockbackDir)
 	local root = model:FindFirstChild("HumanoidRootPart")
 	if root then
 		spawnDamageNumber(root, amount)
+		spawnSparks(root.Position + Vector3.new(0, 1, 0))
 	end
 	flashEnemy(model, data)
 	if knockbackDir then
@@ -739,14 +1262,14 @@ local function spawnEnemy(kind, position, difficultyScale)
 	humanoid.Parent = model
 	model.PrimaryPart = root
 	model.Parent = enemiesFolder
-	buildEnemyVisual(model, root, kind, visualDef)
+	local bodyPart = buildEnemyVisual(model, root, kind, visualDef)
 	local displayName = kind
 	if isBoss then
 		displayName = "BOSS: Skeleton King"
 	elseif isElite then
 		displayName = "Elite " .. kind
 	end
-	makeHealthBar(model, root, displayName)
+	makeHealthBar(model, root, displayName, def.scale)
 	local rewardMult = isElite and 3 or 1
 	local data = {
 		kind = kind,
@@ -759,11 +1282,42 @@ local function spawnEnemy(kind, position, difficultyScale)
 		isBoss = isBoss,
 		isElite = isElite,
 		flashing = false,
+		bodyPart = bodyPart,
+		baseBodySize = bodyPart and bodyPart.Size or nil,
+		phase = math.random() * math.pi * 2,
 	}
 	enemies[model] = data
 	humanoid.Died:Connect(function()
-		onEnemyDeath(model, data)
-		task.wait(0.4)
+		onEnemyDeath(model, data) -- rewards/drops fire here, exactly once
+		-- CORPSE BURST: unweld the visual parts, fling and fade them
+		for _, d in ipairs(model:GetDescendants()) do
+			if d:IsA("WeldConstraint") then d:Destroy() end
+		end
+		local burstParts = {}
+		for _, p in ipairs(model:GetChildren()) do
+			if p:IsA("BasePart") then
+				p.CanCollide = false
+				if p ~= root then
+					p.Anchored = false
+					p.AssemblyLinearVelocity = Vector3.new(
+						math.random(-7, 7), math.random(6, 13), math.random(-7, 7))
+					p.AssemblyAngularVelocity = Vector3.new(
+						math.random(-6, 6), math.random(-6, 6), math.random(-6, 6))
+					table.insert(burstParts, p)
+				end
+			end
+		end
+		task.spawn(function()
+			local t0 = os.clock()
+			while os.clock() - t0 < 0.4 do
+				local a = (os.clock() - t0) / 0.4
+				for _, p in ipairs(burstParts) do
+					if p.Parent then p.Transparency = math.max(p.Transparency, a) end
+				end
+				task.wait(0.04)
+			end
+		end)
+		task.wait(0.45)
 		model:Destroy()
 	end)
 	refreshHealthBar(model)
@@ -870,6 +1424,16 @@ local function aiLoop()
 			local root = model:FindFirstChild("HumanoidRootPart")
 			local humanoid = model:FindFirstChildOfClass("Humanoid")
 			if root and humanoid and humanoid.Health > 0 then
+				-- slime squash-and-stretch bounce
+				if data.kind == "Slime" and data.bodyPart and data.baseBodySize then
+					local bp = data.bodyPart
+					if bp.Parent then
+						local w = math.sin(os.clock() * 6 + data.phase)
+						local bs = data.baseBodySize
+						bp.Size = Vector3.new(
+							bs.X * (1 - 0.07 * w), bs.Y * (1 + 0.16 * w), bs.Z * (1 - 0.07 * w))
+					end
+				end
 				-- find nearest living player
 				local bestPlayer, bestDist = nil, 90
 				for _, player in ipairs(Players:GetPlayers()) do
@@ -920,12 +1484,72 @@ local TIER_COLORS = {
 	Color3.fromRGB(255, 90, 200),
 }
 
+-- Neon slash arc swept in front of the character on each swing
+local function spawnSlashFX(hrp)
+	local arc = Instance.new("Part")
+	arc.Name = "SlashArc"
+	arc.Size = Vector3.new(7, 0.18, 1.6)
+	arc.Color = Color3.fromRGB(190, 240, 255)
+	arc.Material = Enum.Material.Neon
+	arc.Anchored = true
+	arc.CanCollide = false
+	arc.Transparency = 0.25
+	arc.Parent = Workspace
+	local base = CFrame.new(hrp.Position) * (hrp.CFrame - hrp.Position)
+	task.spawn(function()
+		local t0 = os.clock()
+		while arc.Parent do
+			local t = (os.clock() - t0) / 0.12
+			if t >= 1 then break end
+			arc.CFrame = base * CFrame.Angles(0, math.rad(-70 + 140 * t), 0)
+				* CFrame.new(0, 1.2, -4.4)
+			arc.Transparency = 0.25 + 0.75 * t
+			task.wait(0.02)
+		end
+		arc:Destroy()
+	end)
+end
+
+-- (Re)builds the sword's blade assembly for a tier: tinted steel
+-- blade that grows with tier, wedge tip, and from tier 4 a neon
+-- edge glow + light. Grip/guard/pommel are built once in createSword.
 local function styleSword(tool, tier)
-	local handle = tool:FindFirstChild("Handle")
-	if handle then
-		handle.Color = TIER_COLORS[math.clamp(tier, 1, MAX_SWORD_TIER)]
-	end
+	tier = math.clamp(tier, 1, MAX_SWORD_TIER)
 	tool.Name = "Sword (Tier " .. tier .. ")"
+	local handle = tool:FindFirstChild("Handle")
+	if not handle then return end
+	for _, name in ipairs({ "Blade", "BladeTip", "EdgeGlow" }) do
+		local old = tool:FindFirstChild(name)
+		if old then old:Destroy() end
+	end
+	local color = TIER_COLORS[tier]
+	local bladeLen = 2.2 + (tier - 1) * 0.35
+	local function addPart(name, class, size, offset, pColor, material, rot)
+		local p = Instance.new(class)
+		p.Name = name
+		p.Size = size
+		p.Color = pColor
+		p.Material = material or Enum.Material.Metal
+		p.CFrame = handle.CFrame * CFrame.new(offset) * (rot or CFrame.new())
+		p.Parent = tool
+		weldTo(p, handle)
+		return p
+	end
+	addPart("Blade", "Part", Vector3.new(0.14, bladeLen, 0.5),
+		Vector3.new(0, 0.72 + bladeLen / 2, 0), color, Enum.Material.Metal)
+	addPart("BladeTip", "WedgePart", Vector3.new(0.14, 0.65, 0.5),
+		Vector3.new(0, 0.72 + bladeLen + 0.3, 0), color, Enum.Material.Metal,
+		CFrame.Angles(math.rad(-90), 0, 0))
+	if tier >= 4 then
+		local edge = addPart("EdgeGlow", "Part", Vector3.new(0.2, bladeLen, 0.56),
+			Vector3.new(0, 0.72 + bladeLen / 2, 0), color, Enum.Material.Neon)
+		edge.Transparency = 0.35
+		local gl = Instance.new("PointLight")
+		gl.Color = color
+		gl.Range = 10
+		gl.Brightness = 1.6
+		gl.Parent = edge
+	end
 end
 
 local function createSword(player)
@@ -933,12 +1557,32 @@ local function createSword(player)
 	tool.Name = "Sword (Tier 1)"
 	tool.RequiresHandle = true
 	tool.CanBeDropped = false
+	-- modeled sword: leather grip (the Handle) + gold guard + pommel;
+	-- the blade assembly comes from styleSword
 	local handle = Instance.new("Part")
 	handle.Name = "Handle"
-	handle.Size = Vector3.new(0.35, 4.2, 0.9)
-	handle.Color = TIER_COLORS[1]
-	handle.Material = Enum.Material.Metal
+	handle.Size = Vector3.new(0.34, 1.3, 0.34)
+	handle.Color = Color3.fromRGB(60, 40, 25)
+	handle.Material = Enum.Material.Leather
 	handle.Parent = tool
+	local guard = Instance.new("Part")
+	guard.Name = "Guard"
+	guard.Size = Vector3.new(0.3, 0.28, 1.35)
+	guard.Color = Color3.fromRGB(255, 200, 80)
+	guard.Material = Enum.Material.Metal
+	guard.CFrame = handle.CFrame * CFrame.new(0, 0.72, 0)
+	guard.Parent = tool
+	weldTo(guard, handle)
+	local pommel = Instance.new("Part")
+	pommel.Name = "Pommel"
+	pommel.Size = Vector3.new(0.5, 0.5, 0.5)
+	pommel.Shape = Enum.PartType.Ball
+	pommel.Color = Color3.fromRGB(255, 200, 80)
+	pommel.Material = Enum.Material.Metal
+	pommel.CFrame = handle.CFrame * CFrame.new(0, -0.82, 0)
+	pommel.Parent = tool
+	weldTo(pommel, handle)
+	styleSword(tool, 1)
 	tool.Activated:Connect(function()
 		local now = os.clock()
 		local rec = lastAction[player]
@@ -981,6 +1625,13 @@ local function createSword(player)
 				end
 			end
 		end
+		-- slash arc FX + a quick grip twist so the swing reads
+		spawnSlashFX(hrp)
+		local baseGrip = tool.Grip
+		tool.Grip = baseGrip * CFrame.Angles(0, 0, math.rad(-75))
+		task.delay(0.16, function()
+			if tool.Parent then tool.Grip = baseGrip end
+		end)
 		-- Full 360-degree sweep around the player: anything in range is hit.
 		for model, _ in pairs(enemies) do
 			local eroot = model:FindFirstChild("HumanoidRootPart")
@@ -1001,12 +1652,35 @@ local function createFireballTool(player)
 	tool.Name = "Fireball (20 Mana)"
 	tool.RequiresHandle = true
 	tool.CanBeDropped = false
+	-- modeled staff: wooden shaft (the Handle) + glowing orb on top
 	local handle = Instance.new("Part")
 	handle.Name = "Handle"
-	handle.Size = Vector3.new(0.8, 0.8, 2.4)
-	handle.Color = Color3.fromRGB(255, 120, 40)
-	handle.Material = Enum.Material.Neon
+	handle.Size = Vector3.new(0.28, 3.6, 0.28)
+	handle.Color = Color3.fromRGB(105, 72, 40)
+	handle.Material = Enum.Material.Wood
 	handle.Parent = tool
+	local orb = Instance.new("Part")
+	orb.Name = "Orb"
+	orb.Size = Vector3.new(1.15, 1.15, 1.15)
+	orb.Shape = Enum.PartType.Ball
+	orb.Color = Color3.fromRGB(255, 130, 40)
+	orb.Material = Enum.Material.Neon
+	orb.CFrame = handle.CFrame * CFrame.new(0, 2.15, 0)
+	orb.Parent = tool
+	weldTo(orb, handle)
+	local orbLight = Instance.new("PointLight")
+	orbLight.Color = Color3.fromRGB(255, 150, 60)
+	orbLight.Range = 9
+	orbLight.Brightness = 1.5
+	orbLight.Parent = orb
+	local collar = Instance.new("Part")
+	collar.Name = "Collar"
+	collar.Size = Vector3.new(0.55, 0.35, 0.55)
+	collar.Color = Color3.fromRGB(255, 200, 80)
+	collar.Material = Enum.Material.Metal
+	collar.CFrame = handle.CFrame * CFrame.new(0, 1.55, 0)
+	collar.Parent = tool
+	weldTo(collar, handle)
 	tool.Activated:Connect(function()
 		local now = os.clock()
 		local rec = lastAction[player]
@@ -1097,12 +1771,33 @@ local function createPotionTool(player)
 	tool.Name = "Drink Potion"
 	tool.RequiresHandle = true
 	tool.CanBeDropped = false
+	-- modeled bottle: round red glass body (the Handle) + neck + cork
 	local handle = Instance.new("Part")
 	handle.Name = "Handle"
-	handle.Size = Vector3.new(0.7, 1.1, 0.7)
+	handle.Size = Vector3.new(0.85, 1.05, 0.85)
+	handle.Shape = Enum.PartType.Ball
 	handle.Color = Color3.fromRGB(255, 80, 110)
 	handle.Material = Enum.Material.Glass
+	handle.Transparency = 0.15
 	handle.Parent = tool
+	local neck = Instance.new("Part")
+	neck.Name = "Neck"
+	neck.Size = Vector3.new(0.55, 0.36, 0.36)
+	neck.Shape = Enum.PartType.Cylinder
+	neck.Color = Color3.fromRGB(255, 80, 110)
+	neck.Material = Enum.Material.Glass
+	neck.Transparency = 0.15
+	neck.CFrame = handle.CFrame * CFrame.new(0, 0.72, 0) * CFrame.Angles(0, 0, math.rad(90))
+	neck.Parent = tool
+	weldTo(neck, handle)
+	local cork = Instance.new("Part")
+	cork.Name = "Cork"
+	cork.Size = Vector3.new(0.36, 0.3, 0.36)
+	cork.Color = Color3.fromRGB(196, 160, 110)
+	cork.Material = Enum.Material.Wood
+	cork.CFrame = handle.CFrame * CFrame.new(0, 1.05, 0)
+	cork.Parent = tool
+	weldTo(cork, handle)
 	tool.Activated:Connect(function()
 		local now = os.clock()
 		local rec = lastAction[player]
@@ -1386,6 +2081,35 @@ end)
 task.spawn(aiLoop)
 task.spawn(waveLoop)
 
+-- ZONE LOOP (0.5s): campfires heal players standing within 7 studs
+-- (+6 HP/tick, never above max; enemies get nothing), the lava pool
+-- burns players standing in it (8 HP/tick).
+task.spawn(function()
+	local lavaCenter = DUNGEON_CENTER + LAVA_REL
+	while true do
+		task.wait(0.5)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local character = player.Character
+			local hrp = getHRP(character)
+			local humanoid = getHumanoid(character)
+			if hrp and humanoid and humanoid.Health > 0 then
+				local pos = hrp.Position
+				for _, firePos in ipairs(campfirePositions) do
+					if horizontalDistance(pos, firePos) <= 7 and math.abs(pos.Y - firePos.Y) < 6 then
+						humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + 6)
+						break
+					end
+				end
+				if math.abs(pos.X - lavaCenter.X) <= LAVA_HALF
+					and math.abs(pos.Z - lavaCenter.Z) <= LAVA_HALF
+					and pos.Y < 4 then
+					humanoid:TakeDamage(8)
+				end
+			end
+		end
+	end
+end)
+
 -- Autosave every 60 seconds
 task.spawn(function()
 	while true do
@@ -1396,4 +2120,4 @@ task.spawn(function()
 	end
 end)
 
-print("[ShiningSoul] v2 server started: town + dungeon + waves + elites + gear + saving ready.")
+print("[ShiningSoul] v3 server started: art pass + terrain zones (campfires / lava) ready.")
