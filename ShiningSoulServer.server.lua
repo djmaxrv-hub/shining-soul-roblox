@@ -1,14 +1,25 @@
 --====================================================================
--- Shining Soul-type 3D ARPG for Roblox -- v1 (single-file server)
+-- Shining Soul-type 3D ARPG for Roblox -- v2 (single-file server)
 -- Paste this whole file into ONE Script in ServerScriptService.
 -- Everything (map, enemies, tools, HUD, shop, waves) is built and
 -- wired up at runtime by this script. No child scripts are used.
+-- v2: damage numbers + hit flash, elite enemies, gear drops
+--     (Armor / Power), DataStore saving.
 --====================================================================
 
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
 local Debris = game:GetService("Debris")
 local Lighting = game:GetService("Lighting")
+local DataStoreService = game:GetService("DataStoreService")
+
+-- DataStore (all access is pcall-wrapped: if API access is off in
+-- Studio the game just runs with defaults and does not persist)
+local saveStore = nil
+pcall(function()
+	saveStore = DataStoreService:GetDataStore("ShiningSoulV1")
+end)
+local saveReady = {} -- [player] = true once a load attempt succeeded
 
 --====================================================================
 -- CONFIG
@@ -29,6 +40,10 @@ local POTION_HEAL = 55
 local POTION_PRICE = 30
 local MAX_SWORD_TIER = 5
 local MAX_MANA = 100
+local MAX_ARMOR = 5
+local ARMOR_PER_POINT = 0.08 -- each Armor point = 8% less damage taken
+local POWER_PER_CRYSTAL = 3   -- each Power crystal = +3 permanent damage
+local ELITE_CHANCE = 0.12
 
 local function xpThreshold(level)
 	return 40 + level * 30
@@ -355,7 +370,7 @@ local function buildHUD(player)
 
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
-	frame.Size = UDim2.new(0, 240, 0, 138)
+	frame.Size = UDim2.new(0, 240, 0, 182)
 	frame.Position = UDim2.new(0, 12, 0, 12)
 	frame.BackgroundColor3 = Color3.fromRGB(20, 20, 30)
 	frame.BackgroundTransparency = 0.25
@@ -373,6 +388,10 @@ local function buildHUD(player)
 		Color3.fromRGB(255, 140, 160))
 	makeLabel(frame, "WaveLabel", UDim2.new(1, -12, 0, 20), UDim2.new(0, 8, 0, 116), "", 14,
 		Color3.fromRGB(200, 255, 200))
+	makeLabel(frame, "ArmorLabel", UDim2.new(1, -12, 0, 20), UDim2.new(0, 8, 0, 138), "Armor 0", 14,
+		Color3.fromRGB(140, 190, 255))
+	makeLabel(frame, "PowerLabel", UDim2.new(1, -12, 0, 20), UDim2.new(0, 8, 0, 160), "Power +0", 14,
+		Color3.fromRGB(255, 140, 255))
 
 	local banner = makeLabel(gui, "Banner", UDim2.new(1, 0, 0, 44), UDim2.new(0, 0, 0, 60), "", 30,
 		Color3.fromRGB(255, 230, 120))
@@ -397,6 +416,10 @@ local function updateHUD(player)
 	if gold then panel.GoldLabel.Text = "Gold " .. gold.Value end
 	if mana then panel.ManaLabel.Text = "Mana " .. mana.Value .. " / " .. MAX_MANA end
 	if potions then panel.PotionLabel.Text = "Potions " .. potions.Value end
+	local armor = getStat(player, "Stats", "Armor")
+	local power = getStat(player, "Stats", "Power")
+	if armor then panel.ArmorLabel.Text = "Armor " .. armor.Value .. " / " .. MAX_ARMOR end
+	if power then panel.PowerLabel.Text = "Power +" .. power.Value .. " dmg" end
 	panel.WaveLabel.Text = waveStatus
 	local banner = gui:FindFirstChild("Banner")
 	if banner then
@@ -525,17 +548,27 @@ end
 --====================================================================
 -- DROPS + ENEMY SPAWNING / DEATH
 --====================================================================
+local PICKUP_COLORS = {
+	PotionPickup = Color3.fromRGB(255, 80, 110),
+	HealOrb = Color3.fromRGB(90, 255, 140),
+	ArmorPickup = Color3.fromRGB(110, 170, 255),
+	PowerCrystal = Color3.fromRGB(255, 120, 255),
+}
+
 local function spawnPickup(kind, position)
 	local p = Instance.new("Part")
 	p.Name = kind
 	p.Size = Vector3.new(1.4, 1.4, 1.4)
 	p.Shape = Enum.PartType.Ball
-	p.Position = position + Vector3.new(0, 1, 0)
+	if kind == "ArmorPickup" then
+		p.Shape = Enum.PartType.Block
+		p.Size = Vector3.new(1.7, 1.7, 1.7)
+	end
+	p.Position = position + Vector3.new(math.random(-2, 2), 1, math.random(-2, 2))
 	p.Anchored = true
 	p.CanCollide = false
 	p.Material = Enum.Material.Neon
-	p.Color = (kind == "PotionPickup") and Color3.fromRGB(255, 80, 110)
-		or Color3.fromRGB(90, 255, 140)
+	p.Color = PICKUP_COLORS[kind] or Color3.fromRGB(255, 255, 255)
 	p.Parent = dropsFolder
 	Debris:AddItem(p, 30)
 	p.Touched:Connect(function(hit)
@@ -547,7 +580,21 @@ local function spawnPickup(kind, position)
 		if kind == "PotionPickup" then
 			local potions = getStat(player, "Stats", "Potions")
 			if potions then potions.Value = potions.Value + 1 end
-		else
+		elseif kind == "ArmorPickup" then
+			local armor = getStat(player, "Stats", "Armor")
+			if armor and armor.Value < MAX_ARMOR then
+				armor.Value = armor.Value + 1
+				announce(player.Name .. " got Armor " .. armor.Value .. "!", 2)
+			else
+				addGold(player, 50) -- armor maxed: convert to gold
+			end
+		elseif kind == "PowerCrystal" then
+			local power = getStat(player, "Stats", "Power")
+			if power then
+				power.Value = power.Value + POWER_PER_CRYSTAL
+				announce(player.Name .. " got a Power Crystal (+" .. POWER_PER_CRYSTAL .. " dmg)!", 2)
+			end
+		else -- HealOrb
 			humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + 35)
 		end
 		p:Destroy()
@@ -566,6 +613,19 @@ local function onEnemyDeath(model, data)
 	end
 	local root = model:FindFirstChild("HumanoidRootPart")
 	if root then
+		-- guaranteed gear drop from elites and the boss:
+		-- Armor while the killer still needs it, otherwise a Power crystal
+		if data.isElite or data.isBoss then
+			local armor = killer and getStat(killer, "Stats", "Armor")
+			if armor and armor.Value < MAX_ARMOR then
+				spawnPickup("ArmorPickup", root.Position)
+			else
+				spawnPickup("PowerCrystal", root.Position)
+			end
+		elseif math.random() < 0.05 then
+			-- rare power crystal from normal enemies
+			spawnPickup("PowerCrystal", root.Position)
+		end
 		local roll = math.random()
 		if roll < 0.25 then
 			spawnPickup("PotionPickup", root.Position)
@@ -575,6 +635,52 @@ local function onEnemyDeath(model, data)
 	end
 end
 
+-- Floating damage number above the enemy, floats up and fades (~0.7s)
+local function spawnDamageNumber(root, amount)
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "DamageNumber"
+	gui.Size = UDim2.new(3, 0, 1, 0)
+	gui.StudsOffset = Vector3.new(math.random(-8, 8) / 10, 4.6, 0)
+	gui.AlwaysOnTop = true
+	gui.Parent = root
+	local label = makeLabel(gui, "Amount", UDim2.fromScale(1, 1), UDim2.fromScale(0, 0),
+		tostring(math.floor(amount + 0.5)), 20, Color3.fromRGB(255, 230, 120))
+	label.TextXAlignment = Enum.TextXAlignment.Center
+	task.spawn(function()
+		local started = os.clock()
+		while gui.Parent do
+			local t = (os.clock() - started) / 0.7
+			if t >= 1 then break end
+			gui.StudsOffset = gui.StudsOffset + Vector3.new(0, 0.09, 0)
+			label.TextTransparency = t
+			label.TextStrokeTransparency = 0.4 + 0.6 * t
+			task.wait(0.03)
+		end
+		gui:Destroy()
+	end)
+end
+
+-- Brief white flash on the enemy's visual parts when hit
+local function flashEnemy(model, data)
+	if data.flashing then return end
+	data.flashing = true
+	local saved = {}
+	for _, part in ipairs(model:GetChildren()) do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+			saved[part] = part.Color
+			part.Color = Color3.fromRGB(255, 255, 255)
+		end
+	end
+	task.delay(0.08, function()
+		for part, color in pairs(saved) do
+			if part and part.Parent then
+				part.Color = color
+			end
+		end
+		data.flashing = false
+	end)
+end
+
 local function damageEnemy(model, amount, attacker, knockbackDir)
 	local data = enemies[model]
 	if not data then return end
@@ -582,6 +688,11 @@ local function damageEnemy(model, amount, attacker, knockbackDir)
 	if not humanoid or humanoid.Health <= 0 then return end
 	if attacker then data.lastDamager = attacker.UserId end
 	humanoid:TakeDamage(amount)
+	local root = model:FindFirstChild("HumanoidRootPart")
+	if root then
+		spawnDamageNumber(root, amount)
+	end
+	flashEnemy(model, data)
 	if knockbackDir then
 		local root = model:FindFirstChild("HumanoidRootPart")
 		if root then
@@ -598,6 +709,18 @@ local function spawnEnemy(kind, position, difficultyScale)
 	local def = ENEMY_TYPES[kind]
 	if not def then return nil end
 	difficultyScale = difficultyScale or 1
+	-- elites: gold, tougher, hit harder, pay out triple (boss excluded)
+	local isBoss = (kind == "SkeletonKing")
+	local isElite = (not isBoss) and (math.random() < ELITE_CHANCE)
+	local hpMult = isElite and 2.5 or 1
+	local visualDef = def
+	if isElite then
+		visualDef = {
+			scale = def.scale,
+			bodyColor = Color3.fromRGB(255, 190, 60),
+			headColor = Color3.fromRGB(255, 215, 110),
+		}
+	end
 	local model = Instance.new("Model")
 	model.Name = kind
 	local root = Instance.new("Part")
@@ -609,24 +732,33 @@ local function spawnEnemy(kind, position, difficultyScale)
 	root.CanCollide = true
 	root.Parent = model
 	local humanoid = Instance.new("Humanoid")
-	humanoid.MaxHealth = math.floor(def.health * difficultyScale)
+	humanoid.MaxHealth = math.floor(def.health * difficultyScale * hpMult)
 	humanoid.Health = humanoid.MaxHealth
 	humanoid.WalkSpeed = def.speed
 	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
 	humanoid.Parent = model
 	model.PrimaryPart = root
 	model.Parent = enemiesFolder
-	buildEnemyVisual(model, root, kind, def)
-	makeHealthBar(model, root, (kind == "SkeletonKing") and "BOSS: Skeleton King" or kind)
+	buildEnemyVisual(model, root, kind, visualDef)
+	local displayName = kind
+	if isBoss then
+		displayName = "BOSS: Skeleton King"
+	elseif isElite then
+		displayName = "Elite " .. kind
+	end
+	makeHealthBar(model, root, displayName)
+	local rewardMult = isElite and 3 or 1
 	local data = {
 		kind = kind,
-		damage = math.floor(def.damage * (0.8 + 0.2 * difficultyScale)),
+		damage = math.floor(def.damage * (0.8 + 0.2 * difficultyScale) * (isElite and 1.5 or 1)),
 		speed = def.speed,
-		xp = def.xp,
-		gold = def.gold,
+		xp = def.xp * rewardMult,
+		gold = def.gold * rewardMult,
 		lastAttack = 0,
 		lastDamager = nil,
-		isBoss = (kind == "SkeletonKing"),
+		isBoss = isBoss,
+		isElite = isElite,
+		flashing = false,
 	}
 	enemies[model] = data
 	humanoid.Died:Connect(function()
@@ -762,7 +894,11 @@ local function aiLoop()
 						local now = os.clock()
 						if now - data.lastAttack >= 1.1 then
 							data.lastAttack = now
-							phum:TakeDamage(data.damage)
+							-- Armor: each point blocks 8% of incoming damage
+							local armor = getStat(bestPlayer, "Stats", "Armor")
+							local armorPoints = armor and math.clamp(armor.Value, 0, MAX_ARMOR) or 0
+							local finalDamage = data.damage * (1 - ARMOR_PER_POINT * armorPoints)
+							phum:TakeDamage(finalDamage)
 						end
 					end
 				else
@@ -813,9 +949,11 @@ local function createSword(player)
 		if not hrp then return end
 		local level = getStat(player, "leaderstats", "Level")
 		local tier = getStat(player, "Stats", "SwordTier")
+		local power = getStat(player, "Stats", "Power")
 		local dmg = SWORD_BASE_DAMAGE
 			+ ((level and level.Value or 1) - 1) * 2
 			+ ((tier and tier.Value or 1) - 1) * 8
+			+ (power and power.Value or 0)
 		-- AUTO-LOCK: turn to face the nearest enemy and step into range,
 		-- so a click always connects. No manual aiming, no facing check.
 		local nearest, nearestDist = nil, 18
@@ -881,7 +1019,9 @@ local function createFireballTool(player)
 		rec.fire = now
 		mana.Value = mana.Value - FIREBALL_COST
 		local level = getStat(player, "leaderstats", "Level")
+		local firePower = getStat(player, "Stats", "Power")
 		local dmg = FIREBALL_BASE_DAMAGE + ((level and level.Value or 1) - 1) * 3
+			+ (firePower and firePower.Value or 0)
 		-- AUTO-AIM: lock onto the nearest enemy in range. The fireball
 		-- homes in on it, so the player never aims manually.
 		local target, targetDist = nil, 80
@@ -1086,7 +1226,12 @@ local function ensureTools(player)
 		end
 		return false
 	end
-	if not hasTool("Sword") then createSword(player).Parent = backpack end
+	if not hasTool("Sword") then
+		local sword = createSword(player)
+		local tier = getStat(player, "Stats", "SwordTier")
+		if tier then styleSword(sword, tier.Value) end
+		sword.Parent = backpack
+	end
 	if not hasTool("Fireball") then createFireballTool(player).Parent = backpack end
 	if not hasTool("Drink Potion") then createPotionTool(player).Parent = backpack end
 end
@@ -1104,6 +1249,59 @@ local function onCharacterAdded(player, character)
 		hrp.CFrame = townSpawnCFrame
 	end
 	ensureTools(player)
+end
+
+--====================================================================
+-- SAVING (DataStore "ShiningSoulV1")
+--====================================================================
+local SAVE_FIELDS = { "Level", "XP", "Gold" } -- leaderstats
+local SAVE_STATS = { "Potions", "SwordTier", "Armor", "Power" } -- Stats
+
+local function savePlayer(player)
+	if not saveStore or not saveReady[player] then return end
+	local data = {}
+	for _, name in ipairs(SAVE_FIELDS) do
+		local v = getStat(player, "leaderstats", name)
+		if v then data[name] = v.Value end
+	end
+	for _, name in ipairs(SAVE_STATS) do
+		local v = getStat(player, "Stats", name)
+		if v then data[name] = v.Value end
+	end
+	local ok, err = pcall(function()
+		saveStore:SetAsync("player_" .. player.UserId, data)
+	end)
+	if not ok then
+		warn("[ShiningSoul] Save failed for " .. player.Name .. ": " .. tostring(err))
+	end
+end
+
+local function loadPlayer(player)
+	if not saveStore then return end
+	local ok, data = pcall(function()
+		return saveStore:GetAsync("player_" .. player.UserId)
+	end)
+	if not ok then
+		-- API access off / store unavailable: run with defaults, and do
+		-- NOT mark save-ready so defaults never overwrite a real save.
+		warn("[ShiningSoul] Load failed for " .. player.Name .. " (saving disabled this session)")
+		return
+	end
+	saveReady[player] = true
+	if type(data) ~= "table" then return end -- new player, keep defaults
+	local function apply(folderName, name, value, minValue, maxValue)
+		local v = getStat(player, folderName, name)
+		if v and type(value) == "number" then
+			v.Value = math.clamp(math.floor(value), minValue, maxValue)
+		end
+	end
+	apply("leaderstats", "Level", data.Level, 1, 999)
+	apply("leaderstats", "XP", data.XP, 0, 100000000)
+	apply("leaderstats", "Gold", data.Gold, 0, 100000000)
+	apply("Stats", "Potions", data.Potions, 0, 9999)
+	apply("Stats", "SwordTier", data.SwordTier, 1, MAX_SWORD_TIER)
+	apply("Stats", "Armor", data.Armor, 0, MAX_ARMOR)
+	apply("Stats", "Power", data.Power, 0, 100000000)
 end
 
 local function onPlayerAdded(player)
@@ -1129,12 +1327,20 @@ local function onPlayerAdded(player)
 	makeInt(stats, "Mana", MAX_MANA)
 	makeInt(stats, "Potions", 3)
 	makeInt(stats, "SwordTier", 1)
+	makeInt(stats, "Armor", 0)
+	makeInt(stats, "Power", 0)
 	stats.Parent = player
+
+	-- Load saved progress BEFORE the character setup below reads Level
+	loadPlayer(player)
 
 	buildHUD(player)
 
 	local backpack = player:WaitForChild("Backpack")
-	createSword(player).Parent = backpack
+	local startSword = createSword(player)
+	local loadedTier = getStat(player, "Stats", "SwordTier")
+	if loadedTier then styleSword(startSword, loadedTier.Value) end
+	startSword.Parent = backpack
 	createFireballTool(player).Parent = backpack
 	createPotionTool(player).Parent = backpack
 
@@ -1151,7 +1357,15 @@ for _, player in ipairs(Players:GetPlayers()) do
 	task.spawn(onPlayerAdded, player)
 end
 Players.PlayerRemoving:Connect(function(player)
+	savePlayer(player)
 	lastAction[player] = nil
+	saveReady[player] = nil
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		savePlayer(player)
+	end
 end)
 
 --====================================================================
@@ -1172,4 +1386,14 @@ end)
 task.spawn(aiLoop)
 task.spawn(waveLoop)
 
-print("[ShiningSoul] v1 server started: town + dungeon + waves ready.")
+-- Autosave every 60 seconds
+task.spawn(function()
+	while true do
+		task.wait(60)
+		for _, player in ipairs(Players:GetPlayers()) do
+			savePlayer(player)
+		end
+	end
+end)
+
+print("[ShiningSoul] v2 server started: town + dungeon + waves + elites + gear + saving ready.")
