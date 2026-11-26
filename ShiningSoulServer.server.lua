@@ -1,8 +1,15 @@
 --====================================================================
--- Shining Soul-type 3D ARPG for Roblox -- v3 (single-file server)
+-- Shining Soul-type 3D ARPG for Roblox -- v4 (single-file server)
 -- Paste this whole file into ONE Script in ServerScriptService.
 -- Everything (map, enemies, tools, HUD, shop, waves) is built and
 -- wired up at runtime by this script. No child scripts are used.
+-- v4: full EQUIPMENT system -- rarity gear drops (Common / Rare /
+--     Epic / Legendary) from normal / elite / boss enemies, a bag +
+--     equip UI (needs the one-time UIClient LocalScript, see the
+--     README), worn visuals that change the character the moment an
+--     item is equipped (helmet / chest plate / boots on the body,
+--     rarity-styled sword in hand), combat SFX, and selectable
+--     background music (Auto town/dungeon, Calm, Battle, Off).
 -- v2: damage numbers + hit flash, elite enemies, gear drops
 --     (Armor / Power), DataStore saving.
 -- v3: art pass -- modeled weapons (sword / staff / potion bottle),
@@ -23,6 +30,8 @@ local Workspace = game:GetService("Workspace")
 local Debris = game:GetService("Debris")
 local Lighting = game:GetService("Lighting")
 local DataStoreService = game:GetService("DataStoreService")
+local SoundService = game:GetService("SoundService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- DataStore (all access is pcall-wrapped: if API access is off in
 -- Studio the game just runs with defaults and does not persist)
@@ -126,6 +135,46 @@ local function getHumanoid(character)
 	if not character then return nil end
 	return character:FindFirstChildOfClass("Humanoid")
 end
+
+--====================================================================
+-- SOUND EFFECTS (v4). Sounds are cloned per play so they can overlap;
+-- parent them to a part for positional audio, or leave nil for a
+-- flat SoundService play. A dead asset id just stays silent.
+--====================================================================
+local SFX_DEFS = {
+	-- classic engine-bundled sword sounds (always available)
+	Swing = { id = "rbxasset://sounds/swordslash.wav", volume = 0.45 },
+	Equip = { id = "rbxasset://sounds/unsheath.wav", volume = 0.5 },
+	-- public asset ids gathered from community sound lists
+	Hit = { id = "rbxassetid://7122613461", volume = 0.55 },     -- katana slice
+	Death = { id = "rbxassetid://621557962", volume = 0.6, speed = 0.7 }, -- kick thud
+	Pickup = { id = "rbxassetid://131323304", volume = 0.5 },   -- coin collect
+	Drink = { id = "rbxassetid://160745974", volume = 0.6 },    -- drink gulp
+	LevelUp = { id = "rbxassetid://983016958", volume = 0.6 },  -- level-up jingle
+	Hurt = { id = "rbxassetid://10209590", volume = 0.5, speed = 0.9 }, -- flesh hit
+}
+
+local function playSfx(name, atPart, jitter)
+	local def = SFX_DEFS[name]
+	if not def then return end
+	local s = Instance.new("Sound")
+	s.Name = "SFX_" .. name
+	s.SoundId = def.id
+	s.Volume = def.volume or 0.5
+	local speed = def.speed or 1
+	if jitter then
+		speed = speed * (1 + (math.random() * 0.16 - 0.08))
+	end
+	s.PlaybackSpeed = speed
+	s.Parent = atPart or SoundService
+	s:Play()
+	Debris:AddItem(s, 5)
+end
+
+-- Forward declarations: defined in the equipment section further
+-- down, but referenced by earlier code (enemy death, level-ups).
+local spawnGearDrop -- (position, rarityWeights) -> spawns a gear drop
+local maxHealthFor -- (player) -> max HP incl. level + helmet bonus
 
 --====================================================================
 -- WORLD BUILDING
@@ -759,9 +808,10 @@ local function addXP(player, amount)
 		local character = player.Character
 		local humanoid = getHumanoid(character)
 		if humanoid then
-			humanoid.MaxHealth = 100 + (level.Value - 1) * 20
+			humanoid.MaxHealth = maxHealthFor(player)
 			humanoid.Health = humanoid.MaxHealth
 		end
+		playSfx("LevelUp", getHRP(character))
 		announce(player.Name .. " reached Level " .. level.Value .. "!", 3)
 	end
 end
@@ -807,7 +857,29 @@ local function buildHUD(player)
 	local banner = makeLabel(gui, "Banner", UDim2.new(1, 0, 0, 44), UDim2.new(0, 0, 0, 60), "", 30,
 		Color3.fromRGB(255, 230, 120))
 	banner.TextXAlignment = Enum.TextXAlignment.Center
+
+	-- per-player toast line (pickups, bag messages), under the banner
+	local toast = makeLabel(gui, "Toast", UDim2.new(1, 0, 0, 30), UDim2.new(0, 0, 0, 112), "", 19,
+		Color3.fromRGB(255, 215, 120))
+	toast.TextXAlignment = Enum.TextXAlignment.Center
 	return gui
+end
+
+local toastToken = {} -- [player] = counter, guards the clear timer
+
+local function showToast(player, text, seconds)
+	local gui = player:FindFirstChild("PlayerGui") and player.PlayerGui:FindFirstChild("ShiningHUD")
+	if not gui then return end
+	local toast = gui:FindFirstChild("Toast")
+	if not toast then return end
+	toastToken[player] = (toastToken[player] or 0) + 1
+	local token = toastToken[player]
+	toast.Text = text
+	task.delay(seconds or 3, function()
+		if toastToken[player] == token and toast.Parent then
+			toast.Text = ""
+		end
+	end)
 end
 
 local function updateHUD(player)
@@ -1094,6 +1166,7 @@ local function spawnPickup(kind, position)
 		else -- HealOrb
 			humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + 35)
 		end
+		playSfx("Pickup", getHRP(character))
 		p:Destroy()
 	end)
 end
@@ -1122,6 +1195,19 @@ local function onEnemyDeath(model, data)
 		elseif math.random() < 0.05 then
 			-- rare power crystal from normal enemies
 			spawnPickup("PowerCrystal", root.Position)
+		end
+		-- EQUIPMENT drops (v4): rarity odds scale with enemy rank
+		if spawnGearDrop then
+			if data.isBoss then
+				spawnGearDrop(root.Position, { { "Epic", 70 }, { "Legendary", 30 } })
+			elseif data.isElite then
+				if math.random() < 0.60 then
+					spawnGearDrop(root.Position,
+						{ { "Rare", 60 }, { "Epic", 35 }, { "Legendary", 5 } })
+				end
+			elseif math.random() < 0.08 then
+				spawnGearDrop(root.Position, { { "Common", 70 }, { "Rare", 30 } })
+			end
 		end
 		local roll = math.random()
 		if roll < 0.25 then
@@ -1214,6 +1300,7 @@ local function damageEnemy(model, amount, attacker, knockbackDir)
 	if root then
 		spawnDamageNumber(root, amount)
 		spawnSparks(root.Position + Vector3.new(0, 1, 0))
+		playSfx("Hit", root, true)
 	end
 	flashEnemy(model, data)
 	if knockbackDir then
@@ -1288,6 +1375,8 @@ local function spawnEnemy(kind, position, difficultyScale)
 	}
 	enemies[model] = data
 	humanoid.Died:Connect(function()
+		local dRoot = model:FindFirstChild("HumanoidRootPart")
+		if dRoot then playSfx("Death", dRoot) end
 		onEnemyDeath(model, data) -- rewards/drops fire here, exactly once
 		-- CORPSE BURST: unweld the visual parts, fling and fade them
 		for _, d in ipairs(model:GetDescendants()) do
@@ -1458,11 +1547,16 @@ local function aiLoop()
 						local now = os.clock()
 						if now - data.lastAttack >= 1.1 then
 							data.lastAttack = now
-							-- Armor: each point blocks 8% of incoming damage
+							-- Damage reduction: Armor points (8% each) plus
+							-- equipped chest % -- combined, capped at 75%.
 							local armor = getStat(bestPlayer, "Stats", "Armor")
 							local armorPoints = armor and math.clamp(armor.Value, 0, MAX_ARMOR) or 0
-							local finalDamage = data.damage * (1 - ARMOR_PER_POINT * armorPoints)
-							phum:TakeDamage(finalDamage)
+							local gearDEF = getStat(bestPlayer, "Stats", "GearDEF")
+							local reduction = ARMOR_PER_POINT * armorPoints
+								+ (gearDEF and gearDEF.Value or 0) / 100
+							reduction = math.min(reduction, 0.75)
+							phum:TakeDamage(data.damage * (1 - reduction))
+							playSfx("Hurt", phrp, true)
 						end
 					end
 				else
@@ -1594,10 +1688,13 @@ local function createSword(player)
 		local level = getStat(player, "leaderstats", "Level")
 		local tier = getStat(player, "Stats", "SwordTier")
 		local power = getStat(player, "Stats", "Power")
+		local gearATK = getStat(player, "Stats", "GearATK")
 		local dmg = SWORD_BASE_DAMAGE
 			+ ((level and level.Value or 1) - 1) * 2
 			+ ((tier and tier.Value or 1) - 1) * 8
 			+ (power and power.Value or 0)
+			+ (gearATK and gearATK.Value or 0)
+		playSfx("Swing", hrp, true)
 		-- AUTO-LOCK: turn to face the nearest enemy and step into range,
 		-- so a click always connects. No manual aiming, no facing check.
 		local nearest, nearestDist = nil, 18
@@ -1694,8 +1791,10 @@ local function createFireballTool(player)
 		mana.Value = mana.Value - FIREBALL_COST
 		local level = getStat(player, "leaderstats", "Level")
 		local firePower = getStat(player, "Stats", "Power")
+		local fireGearATK = getStat(player, "Stats", "GearATK")
 		local dmg = FIREBALL_BASE_DAMAGE + ((level and level.Value or 1) - 1) * 3
 			+ (firePower and firePower.Value or 0)
+			+ (fireGearATK and fireGearATK.Value or 0)
 		-- AUTO-AIM: lock onto the nearest enemy in range. The fireball
 		-- homes in on it, so the player never aims manually.
 		local target, targetDist = nil, 80
@@ -1809,9 +1908,643 @@ local function createPotionTool(player)
 		rec.potion = now
 		potions.Value = potions.Value - 1
 		humanoid.Health = math.min(humanoid.MaxHealth, humanoid.Health + POTION_HEAL)
+		playSfx("Drink", getHRP(player.Character))
 	end)
 	return tool
 end
+
+--====================================================================
+-- EQUIPMENT SYSTEM (v4): rarity gear, bag + equip UI, worn visuals,
+-- selectable BGM. Per-player state lives server-side in gearState;
+-- the client only forwards button clicks via UIEvent (see the
+-- UIClient LocalScript) and plays the BGM track it is told to.
+--====================================================================
+local MAX_INVENTORY = 24
+local GEAR_SLOTS = { "Weapon", "Helmet", "Chest", "Boots" }
+
+local RARITIES = {
+	Common = { color = Color3.fromRGB(235, 235, 235), gearColor = Color3.fromRGB(165, 165, 175) },
+	Rare = { color = Color3.fromRGB(80, 160, 255), gearColor = Color3.fromRGB(85, 140, 215) },
+	Epic = { color = Color3.fromRGB(190, 100, 255), gearColor = Color3.fromRGB(150, 90, 215) },
+	Legendary = { color = Color3.fromRGB(255, 155, 40), gearColor = Color3.fromRGB(240, 165, 55) },
+}
+
+-- stat roll bands per slot + rarity (Weapon=ATK, Helmet=HP,
+-- Chest=damage-reduction %, Boots=WalkSpeed)
+local STAT_BANDS = {
+	Weapon = { Common = { 4, 7 }, Rare = { 8, 13 }, Epic = { 14, 22 }, Legendary = { 23, 35 } },
+	Helmet = { Common = { 10, 20 }, Rare = { 25, 45 }, Epic = { 50, 85 }, Legendary = { 90, 150 } },
+	Chest = { Common = { 3, 5 }, Rare = { 6, 10 }, Epic = { 11, 16 }, Legendary = { 17, 24 } },
+	Boots = { Common = { 1, 2 }, Rare = { 3, 4 }, Epic = { 5, 6 }, Legendary = { 7, 9 } },
+}
+
+local NAME_POOLS = {
+	Weapon = {
+		Common = { "Iron Sword", "Soldier's Blade", "Worn Saber", "Militia Sword" },
+		Rare = { "Knight Blade", "Azure Edge", "Frostbrand", "Storm Saber" },
+		Epic = { "Void Reaver", "Shadowfang", "Rune Greatblade", "Nightfall Edge" },
+		Legendary = { "Sunfire Greatsword", "Dragonwrath Blade", "Kingsbane", "Blade of the Dawn" },
+	},
+	Helmet = {
+		Common = { "Iron Cap", "Leather Hood", "Guard Helm", "Bronze Helm" },
+		Rare = { "Knight Helm", "Sapphire Circlet", "Wolfguard Hood", "Azure Greathelm" },
+		Epic = { "Void Crown", "Shadowveil Hood", "Runed Warhelm", "Nightlord Crown" },
+		Legendary = { "Sunfire Crown", "Dragonlord Helm", "Crown of Kings", "Halo of Dawn" },
+	},
+	Chest = {
+		Common = { "Iron Breastplate", "Leather Armor", "Chain Vest", "Bronze Cuirass" },
+		Rare = { "Knight Plate", "Azure Mail", "Frostguard Plate", "Storm Cuirass" },
+		Epic = { "Void Plate", "Shadowmail", "Rune Aegis Armor", "Nightfall Plate" },
+		Legendary = { "Sunfire Aegis", "Dragonscale Armor", "Kingsguard Plate", "Dawnforged Armor" },
+	},
+	Boots = {
+		Common = { "Iron Greaves", "Leather Boots", "Traveler Boots", "Bronze Sabatons" },
+		Rare = { "Knight Greaves", "Azure Striders", "Swiftwind Boots", "Storm Sabatons" },
+		Epic = { "Void Treads", "Shadowstep Boots", "Rune Striders", "Nightfall Greaves" },
+		Legendary = { "Sunfire Sabatons", "Dragonflight Boots", "Kingswind Striders", "Dawnstrider Boots" },
+	},
+}
+
+local gearState = {}   -- [player] = { inv = {item,...}, equipped = {slot=item} }
+local bagOpen = {}     -- [player] = bool
+local bagRefs = {}     -- [player] = { gui, button, panel }
+local musicMode = {}   -- [player] = "Auto" | "Calm" | "Battle" | "Off"
+local sentTrack = {}   -- [player] = last track key sent to the client
+local lastMusicSent = {} -- [player] = os.clock() of last music send
+local gearIdCounter = 0
+
+local uiEvent = ReplicatedStorage:FindFirstChild("UIEvent")
+if not uiEvent then
+	uiEvent = Instance.new("RemoteEvent")
+	uiEvent.Name = "UIEvent"
+	uiEvent.Parent = ReplicatedStorage
+end
+
+local function darkOf(c)
+	return Color3.new(c.R * 0.32, c.G * 0.32, c.B * 0.32)
+end
+
+local function statTextFor(item)
+	if item.slot == "Weapon" then
+		return "+" .. item.stat .. " ATK"
+	elseif item.slot == "Helmet" then
+		return "+" .. item.stat .. " HP"
+	elseif item.slot == "Chest" then
+		return "+" .. item.stat .. "% DEF"
+	else
+		return "+" .. item.stat .. " SPD"
+	end
+end
+
+maxHealthFor = function(player)
+	local level = getStat(player, "leaderstats", "Level")
+	local hp = 100 + ((level and level.Value or 1) - 1) * 20
+	local state = gearState[player]
+	if state and state.equipped.Helmet then
+		hp = hp + state.equipped.Helmet.stat
+	end
+	return hp
+end
+
+-- Rarity styling for the held sword: colored blade that grows with
+-- rarity, neon edge + light from Rare up, biggest for Legendary.
+local WEAPON_STYLE = {
+	Common = { color = Color3.fromRGB(175, 175, 185), len = 2.4, glow = false },
+	Rare = { color = Color3.fromRGB(80, 160, 255), len = 2.8, glow = true },
+	Epic = { color = Color3.fromRGB(190, 100, 255), len = 3.2, glow = true },
+	Legendary = { color = Color3.fromRGB(255, 155, 40), len = 3.8, glow = true },
+}
+
+local function styleSwordRarity(tool, rarity)
+	local st = WEAPON_STYLE[rarity] or WEAPON_STYLE.Common
+	tool.Name = "Sword (" .. rarity .. ")"
+	local handle = tool:FindFirstChild("Handle")
+	if not handle then return end
+	for _, name in ipairs({ "Blade", "BladeTip", "EdgeGlow" }) do
+		local old = tool:FindFirstChild(name)
+		if old then old:Destroy() end
+	end
+	local function addPart(name, class, size, offset, pColor, material, rot)
+		local p = Instance.new(class)
+		p.Name = name
+		p.Size = size
+		p.Color = pColor
+		p.Material = material or Enum.Material.Metal
+		p.CFrame = handle.CFrame * CFrame.new(offset) * (rot or CFrame.new())
+		p.Parent = tool
+		weldTo(p, handle)
+		return p
+	end
+	addPart("Blade", "Part", Vector3.new(0.16, st.len, 0.52),
+		Vector3.new(0, 0.72 + st.len / 2, 0), st.color, Enum.Material.Metal)
+	addPart("BladeTip", "WedgePart", Vector3.new(0.16, 0.65, 0.52),
+		Vector3.new(0, 0.72 + st.len + 0.3, 0), st.color, Enum.Material.Metal,
+		CFrame.Angles(math.rad(-90), 0, 0))
+	if st.glow then
+		local edge = addPart("EdgeGlow", "Part", Vector3.new(0.22, st.len, 0.58),
+			Vector3.new(0, 0.72 + st.len / 2, 0), st.color, Enum.Material.Neon)
+		edge.Transparency = 0.35
+		local gl = Instance.new("PointLight")
+		gl.Color = st.color
+		gl.Range = (rarity == "Legendary") and 15 or 10
+		gl.Brightness = 1.8
+		gl.Parent = edge
+	end
+end
+
+-- The held sword always shows the equipped weapon's rarity; with no
+-- weapon equipped it falls back to the blacksmith tier styling.
+local function restylePlayerSword(player)
+	local state = gearState[player]
+	local weapon = state and state.equipped.Weapon
+	local tier = getStat(player, "Stats", "SwordTier")
+	local function restyle(tool)
+		if weapon then
+			styleSwordRarity(tool, weapon.rarity)
+		elseif tier then
+			styleSword(tool, tier.Value)
+		end
+	end
+	local backpack = player:FindFirstChild("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") and string.find(t.Name, "Sword", 1, true) then restyle(t) end
+		end
+	end
+	if player.Character then
+		for _, t in ipairs(player.Character:GetChildren()) do
+			if t:IsA("Tool") and string.find(t.Name, "Sword", 1, true) then restyle(t) end
+		end
+	end
+end
+
+-- Worn gear visuals: helmet / chest plates / boots welded onto the
+-- character in a "WornGear" model, rebuilt on every equip change.
+local function weldGearPart(part, bodyPart)
+	part.Anchored = false
+	part.CanCollide = false
+	part.Massless = true
+	local w = Instance.new("WeldConstraint")
+	w.Part0 = bodyPart
+	w.Part1 = part
+	w.Parent = part
+end
+
+local function rebuildWornGear(player)
+	local character = player.Character
+	if not character then return end
+	local old = character:FindFirstChild("WornGear")
+	if old then old:Destroy() end
+	local state = gearState[player]
+	if not state then return end
+	local eq = state.equipped
+	if not eq.Helmet and not eq.Chest and not eq.Boots then return end
+	local model = Instance.new("Model")
+	model.Name = "WornGear"
+	model.Parent = character
+	local function add(name, size, cframe, color, material, shape)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.Color = color
+		p.Material = material or Enum.Material.Metal
+		if shape then p.Shape = shape end
+		p.CFrame = cframe
+		p.Parent = model
+		return p
+	end
+
+	if eq.Helmet then
+		local head = character:FindFirstChild("Head")
+		if head then
+			local c = RARITIES[eq.Helmet.rarity].gearColor
+			local dome = add("HelmetDome", Vector3.new(1.75, 1.05, 1.75),
+				head.CFrame * CFrame.new(0, 0.42, 0), c, Enum.Material.Metal, Enum.PartType.Ball)
+			weldGearPart(dome, head)
+			local brim = add("HelmetBrim", Vector3.new(0.3, 2.1, 2.1),
+				head.CFrame * CFrame.new(0, 0.08, 0) * CFrame.Angles(0, 0, math.rad(90)),
+				c, Enum.Material.Metal, Enum.PartType.Cylinder)
+			weldGearPart(brim, head)
+			if eq.Helmet.rarity == "Legendary" then
+				for i = -1, 1 do
+					local spike = add("CrownSpike", Vector3.new(0.22, 0.7, 0.22),
+						head.CFrame * CFrame.new(i * 0.45, 1.05, 0),
+						RARITIES.Legendary.color, Enum.Material.Metal)
+					weldGearPart(spike, head)
+				end
+				local gl = Instance.new("PointLight")
+				gl.Color = RARITIES.Legendary.color
+				gl.Range = 9
+				gl.Brightness = 1.4
+				gl.Parent = dome
+			end
+		end
+	end
+
+	if eq.Chest then
+		local torso = character:FindFirstChild("UpperTorso") or character:FindFirstChild("Torso")
+		if torso then
+			local c = RARITIES[eq.Chest.rarity].gearColor
+			local halfDepth = torso.Size.Z / 2
+			local front = add("ChestPlate", Vector3.new(1.9, 1.9, 0.22),
+				torso.CFrame * CFrame.new(0, 0, -halfDepth - 0.12), c, Enum.Material.Metal)
+			weldGearPart(front, torso)
+			local back = add("BackPlate", Vector3.new(1.9, 1.9, 0.22),
+				torso.CFrame * CFrame.new(0, 0, halfDepth + 0.12), c, Enum.Material.Metal)
+			weldGearPart(back, torso)
+			if eq.Chest.rarity ~= "Common" then
+				local gem = add("ChestGem", Vector3.new(0.45, 0.45, 0.2),
+					torso.CFrame * CFrame.new(0, 0.15, -halfDepth - 0.28),
+					RARITIES[eq.Chest.rarity].color, Enum.Material.Neon, Enum.PartType.Ball)
+				weldGearPart(gem, torso)
+			end
+		end
+	end
+
+	if eq.Boots then
+		local c = RARITIES[eq.Boots.rarity].gearColor
+		for _, names in ipairs({ { "LeftFoot", "Left Leg" }, { "RightFoot", "Right Leg" } }) do
+			local foot = character:FindFirstChild(names[1]) or character:FindFirstChild(names[2])
+			if foot then
+				local boot = add("Boot", Vector3.new(0.95, 0.75, 1.35),
+					foot.CFrame * CFrame.new(0, -foot.Size.Y / 2 + 0.32, -0.12),
+					c, Enum.Material.Metal)
+				weldGearPart(boot, foot)
+			end
+		end
+	end
+end
+
+-- Recompute all gear-derived state: Stats bonuses, HP cap (keeping
+-- the current HP ratio), walk speed, worn visuals, sword styling.
+local function applyGear(player)
+	local state = gearState[player]
+	if not state then return end
+	local eq = state.equipped
+	local atk = getStat(player, "Stats", "GearATK")
+	if atk then atk.Value = eq.Weapon and eq.Weapon.stat or 0 end
+	local def = getStat(player, "Stats", "GearDEF")
+	if def then def.Value = eq.Chest and eq.Chest.stat or 0 end
+	local humanoid = getHumanoid(player.Character)
+	if humanoid then
+		local newMax = maxHealthFor(player)
+		if humanoid.MaxHealth ~= newMax and humanoid.MaxHealth > 0 then
+			local ratio = humanoid.Health / humanoid.MaxHealth
+			humanoid.MaxHealth = newMax
+			if humanoid.Health > 0 then
+				humanoid.Health = math.clamp(ratio * newMax, 1, newMax)
+			end
+		end
+		humanoid.WalkSpeed = 16 + (eq.Boots and eq.Boots.stat or 0)
+	end
+	rebuildWornGear(player)
+	restylePlayerSword(player)
+end
+
+--====================================================================
+-- BAG + EQUIP UI (server-built; clicks arrive via UIEvent)
+--====================================================================
+local function rebuildBagUI(player)
+	local refs = bagRefs[player]
+	local state = gearState[player]
+	if not refs or not state then return end
+	refs.button.Text = "Bag (" .. #state.inv .. ")"
+	local panel = refs.panel
+	panel.Visible = bagOpen[player] and true or false
+	for _, child in ipairs(panel:GetChildren()) do
+		child:Destroy()
+	end
+
+	makeLabel(panel, "Title", UDim2.new(1, -20, 0, 26), UDim2.new(0, 10, 0, 6),
+		"INVENTORY", 18, Color3.fromRGB(255, 230, 160))
+
+	-- music mode row
+	makeLabel(panel, "MusicLabel", UDim2.new(0, 56, 0, 24), UDim2.new(0, 10, 0, 38),
+		"Music:", 14, Color3.fromRGB(180, 200, 255))
+	for i, mode in ipairs({ "Auto", "Calm", "Battle", "Off" }) do
+		local b = Instance.new("TextButton")
+		b.Name = "Music_" .. mode
+		b.Size = UDim2.new(0, 66, 0, 24)
+		b.Position = UDim2.new(0, 72 + (i - 1) * 72, 0, 38)
+		b.Text = mode
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 13
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.BackgroundColor3 = (musicMode[player] == mode)
+			and Color3.fromRGB(70, 115, 60) or Color3.fromRGB(45, 45, 62)
+		b.BorderSizePixel = 0
+		b:SetAttribute("Act", "Music")
+		b:SetAttribute("Arg", mode)
+		b.Parent = panel
+	end
+
+	-- equipped column (left): click a slot to unequip
+	makeLabel(panel, "EqHeader", UDim2.new(0, 180, 0, 18), UDim2.new(0, 10, 0, 70),
+		"EQUIPPED", 13, Color3.fromRGB(170, 170, 185))
+	for i, slot in ipairs(GEAR_SLOTS) do
+		local item = state.equipped[slot]
+		local b = Instance.new("TextButton")
+		b.Name = "Slot_" .. slot
+		b.Size = UDim2.new(0, 180, 0, 52)
+		b.Position = UDim2.new(0, 10, 0, 92 + (i - 1) * 58)
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 12
+		b.TextWrapped = true
+		b.BorderSizePixel = 0
+		if item then
+			local rc = RARITIES[item.rarity].color
+			b.Text = slot .. ": " .. item.name .. "\n" .. statTextFor(item)
+			b.BackgroundColor3 = darkOf(rc)
+			b.TextColor3 = rc
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = rc
+			stroke.Thickness = 2
+			stroke.Parent = b
+		else
+			b.Text = slot .. ": Empty"
+			b.BackgroundColor3 = Color3.fromRGB(35, 35, 46)
+			b.TextColor3 = Color3.fromRGB(150, 150, 160)
+		end
+		b:SetAttribute("Act", "Unequip")
+		b:SetAttribute("Arg", slot)
+		b.Parent = panel
+	end
+
+	-- bag grid (right): 4 x 6, click an item to equip it
+	makeLabel(panel, "BagHeader", UDim2.new(0, 280, 0, 18), UDim2.new(0, 206, 0, 70),
+		"BAG (" .. #state.inv .. "/" .. MAX_INVENTORY .. ")", 13,
+		Color3.fromRGB(170, 170, 185))
+	for idx = 1, MAX_INVENTORY do
+		local col = (idx - 1) % 4
+		local row = math.floor((idx - 1) / 4)
+		local x = 206 + col * 72
+		local y = 92 + row * 52
+		local item = state.inv[idx]
+		if item then
+			local rc = RARITIES[item.rarity].color
+			local b = Instance.new("TextButton")
+			b.Name = "Item_" .. item.id
+			b.Size = UDim2.new(0, 66, 0, 46)
+			b.Position = UDim2.new(0, x, 0, y)
+			b.Text = item.name .. "\n" .. statTextFor(item)
+			b.Font = Enum.Font.Gotham
+			b.TextSize = 10
+			b.TextWrapped = true
+			b.BackgroundColor3 = darkOf(rc)
+			b.TextColor3 = rc
+			b.BorderSizePixel = 0
+			local stroke = Instance.new("UIStroke")
+			stroke.Color = rc
+			stroke.Thickness = 2
+			stroke.Parent = b
+			b:SetAttribute("Act", "Equip")
+			b:SetAttribute("Arg", item.id)
+			b.Parent = panel
+		else
+			local f = Instance.new("Frame")
+			f.Name = "EmptyCell"
+			f.Size = UDim2.new(0, 66, 0, 46)
+			f.Position = UDim2.new(0, x, 0, y)
+			f.BackgroundColor3 = Color3.fromRGB(27, 27, 37)
+			f.BorderSizePixel = 0
+			f.Parent = panel
+		end
+	end
+end
+
+local function buildBagUI(player)
+	local playerGui = player:WaitForChild("PlayerGui")
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ShiningBag"
+	gui.ResetOnSpawn = false
+	gui.Parent = playerGui
+
+	local button = Instance.new("TextButton")
+	button.Name = "BagButton"
+	button.Size = UDim2.new(0, 110, 0, 36)
+	button.Position = UDim2.new(0, 12, 0, 206)
+	button.Text = "Bag (0)"
+	button.Font = Enum.Font.GothamBold
+	button.TextSize = 16
+	button.TextColor3 = Color3.fromRGB(255, 255, 255)
+	button.BackgroundColor3 = Color3.fromRGB(32, 32, 48)
+	button.BackgroundTransparency = 0.15
+	button.BorderSizePixel = 0
+	button:SetAttribute("Act", "ToggleBag")
+	button.Parent = gui
+
+	local panel = Instance.new("Frame")
+	panel.Name = "BagPanel"
+	panel.Size = UDim2.new(0, 500, 0, 408)
+	panel.Position = UDim2.new(0.5, -250, 0.5, -204)
+	panel.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+	panel.BackgroundTransparency = 0.08
+	panel.BorderSizePixel = 0
+	panel.Visible = false
+	panel.Parent = gui
+
+	bagRefs[player] = { gui = gui, button = button, panel = panel }
+	rebuildBagUI(player)
+end
+
+local function equipItem(player, itemId)
+	local state = gearState[player]
+	if not state then return end
+	for i, item in ipairs(state.inv) do
+		if item.id == itemId then
+			table.remove(state.inv, i)
+			local old = state.equipped[item.slot]
+			if old then table.insert(state.inv, old) end
+			state.equipped[item.slot] = item
+			applyGear(player)
+			rebuildBagUI(player)
+			playSfx("Equip", getHRP(player.Character))
+			showToast(player, "Equipped: " .. item.name, 2)
+			return
+		end
+	end
+end
+
+local function unequipItem(player, slot)
+	local state = gearState[player]
+	if not state then return end
+	local item = state.equipped[slot]
+	if not item then return end
+	if #state.inv >= MAX_INVENTORY then
+		showToast(player, "Bag full!", 2)
+		return
+	end
+	state.equipped[slot] = nil
+	table.insert(state.inv, item)
+	applyGear(player)
+	rebuildBagUI(player)
+	playSfx("Equip", getHRP(player.Character))
+end
+
+--====================================================================
+-- GEAR DROPS (called from onEnemyDeath via the forward declaration)
+--====================================================================
+local function rollRarityFromWeights(weights)
+	local total = 0
+	for _, w in ipairs(weights) do total = total + w[2] end
+	local r = math.random(1, total)
+	local acc = 0
+	for _, w in ipairs(weights) do
+		acc = acc + w[2]
+		if r <= acc then return w[1] end
+	end
+	return weights[1][1]
+end
+
+local function rollGearItem(rarity)
+	local slot = GEAR_SLOTS[math.random(1, #GEAR_SLOTS)]
+	local band = STAT_BANDS[slot][rarity]
+	local pool = NAME_POOLS[slot][rarity]
+	gearIdCounter = gearIdCounter + 1
+	return {
+		id = "g" .. gearIdCounter,
+		slot = slot,
+		rarity = rarity,
+		name = pool[math.random(1, #pool)],
+		stat = math.random(band[1], band[2]),
+	}
+end
+
+spawnGearDrop = function(position, weights)
+	local item = rollGearItem(rollRarityFromWeights(weights))
+	local rc = RARITIES[item.rarity].color
+	-- ground the drop: the position passed in is an enemy root
+	-- (~2 studs up), but the pedestal must sit on the floor (y = 0)
+	local dropPos = Vector3.new(
+		position.X + math.random(-2, 2), 0, position.Z + math.random(-2, 2))
+	local model = Instance.new("Model")
+	model.Name = "GearDrop"
+	model.Parent = dropsFolder
+
+	local base = Instance.new("Part")
+	base.Name = "Pedestal"
+	base.Shape = Enum.PartType.Cylinder
+	base.Size = Vector3.new(0.5, 3.2, 3.2)
+	base.CFrame = CFrame.new(dropPos.X, dropPos.Y + 0.25, dropPos.Z)
+		* CFrame.Angles(0, 0, math.rad(90))
+	base.Color = Color3.fromRGB(52, 52, 62)
+	base.Material = Enum.Material.Slate
+	base.Anchored = true
+	base.Parent = model
+
+	local orb = Instance.new("Part")
+	orb.Name = "GearOrb"
+	orb.Shape = Enum.PartType.Ball
+	local orbSize = (item.rarity == "Legendary") and 1.9 or 1.5
+	orb.Size = Vector3.new(orbSize, orbSize, orbSize)
+	orb.Position = dropPos + Vector3.new(0, 2.1, 0)
+	orb.Color = rc
+	orb.Material = Enum.Material.Neon
+	orb.Anchored = true
+	orb.CanCollide = false
+	orb.Parent = model
+	local light = Instance.new("PointLight")
+	light.Color = rc
+	light.Range = 13
+	light.Brightness = 2.2
+	light.Parent = orb
+
+	local gui = Instance.new("BillboardGui")
+	gui.Name = "ItemName"
+	gui.Size = UDim2.new(5, 0, 1.1, 0)
+	gui.StudsOffset = Vector3.new(0, 1.9, 0)
+	gui.AlwaysOnTop = true
+	gui.Parent = orb
+	local nameLabel = makeLabel(gui, "Name", UDim2.fromScale(1, 1), UDim2.fromScale(0, 0),
+		item.name, 15, rc)
+	nameLabel.TextXAlignment = Enum.TextXAlignment.Center
+
+	Debris:AddItem(model, 60)
+	-- gentle bob while the drop waits
+	local orbBaseY = orb.Position.Y
+	task.spawn(function()
+		while model.Parent do
+			orb.Position = Vector3.new(dropPos.X,
+				orbBaseY + math.sin(os.clock() * 2.2) * 0.25, dropPos.Z)
+			task.wait(0.05)
+		end
+	end)
+
+	local claimed = false
+	orb.Touched:Connect(function(hit)
+		if claimed then return end
+		local character = hit and hit.Parent
+		local humanoid = getHumanoid(character)
+		if not humanoid or humanoid.Health <= 0 then return end
+		local player = Players:GetPlayerFromCharacter(character)
+		if not player then return end
+		local state = gearState[player]
+		if not state then return end
+		if #state.inv >= MAX_INVENTORY then
+			showToast(player, "Bag full!", 2)
+			return
+		end
+		claimed = true
+		table.insert(state.inv, item)
+		showToast(player, "Picked up: " .. item.name, 3)
+		playSfx("Pickup", getHRP(character))
+		rebuildBagUI(player)
+		model:Destroy()
+	end)
+end
+
+--====================================================================
+-- BACKGROUND MUSIC: server picks the track, client plays it.
+-- Auto = Calm in town, Battle in the dungeon; fixed modes pin one
+-- track everywhere; Off stops. Changes go out on UIEvent.
+--====================================================================
+local function zoneTrackFor(player)
+	local hrp = getHRP(player.Character)
+	if hrp and inDungeon(hrp.Position) then
+		return "Battle"
+	end
+	return "Calm"
+end
+
+local function effectiveTrack(player)
+	local mode = musicMode[player] or "Auto"
+	if mode == "Off" then return nil end
+	if mode == "Calm" then return "Calm" end
+	if mode == "Battle" then return "Battle" end
+	return zoneTrackFor(player)
+end
+
+local function sendMusic(player, force)
+	local track = effectiveTrack(player)
+	if force or sentTrack[player] ~= track then
+		sentTrack[player] = track
+		lastMusicSent[player] = os.clock()
+		uiEvent:FireClient(player, "Music", track or "Off")
+	end
+end
+
+local function setMusicMode(player, mode)
+	if mode ~= "Auto" and mode ~= "Calm" and mode ~= "Battle" and mode ~= "Off" then
+		return
+	end
+	musicMode[player] = mode
+	rebuildBagUI(player)
+	sendMusic(player)
+end
+
+uiEvent.OnServerEvent:Connect(function(player, act, arg)
+	if type(act) ~= "string" then return end
+	if act == "ToggleBag" then
+		bagOpen[player] = not bagOpen[player]
+		rebuildBagUI(player)
+	elseif act == "Equip" then
+		if type(arg) == "string" then equipItem(player, arg) end
+	elseif act == "Unequip" then
+		if type(arg) == "string" then unequipItem(player, arg) end
+	elseif act == "Music" then
+		if type(arg) == "string" then setMusicMode(player, arg) end
+	end
+end)
 
 --====================================================================
 -- SHOP PROMPTS
@@ -1854,18 +2587,8 @@ local function setupShop()
 		if gold.Value >= price then
 			gold.Value = gold.Value - price
 			tier.Value = tier.Value + 1
-			-- restyle sword wherever it currently is
-			local backpack = player:FindFirstChild("Backpack")
-			if backpack then
-				for _, t in ipairs(backpack:GetChildren()) do
-					if t:IsA("Tool") and string.find(t.Name, "Sword") then styleSword(t, tier.Value) end
-				end
-			end
-			if player.Character then
-				for _, t in ipairs(player.Character:GetChildren()) do
-					if t:IsA("Tool") and string.find(t.Name, "Sword") then styleSword(t, tier.Value) end
-				end
-			end
+			-- restyle the sword (an equipped weapon's rarity style wins)
+			restylePlayerSword(player)
 			announce(player.Name .. " upgraded sword to Tier " .. tier.Value .. "!", 3)
 		else
 			announce("Need " .. price .. " gold to upgrade!", 2)
@@ -1892,6 +2615,7 @@ local function setupPortal(part, destination)
 			hrp.CFrame = CFrame.new(destination)
 			hrp.AssemblyLinearVelocity = Vector3.zero
 		end
+		sendMusic(player) -- zone changed: Auto music follows
 	end)
 end
 setupPortal(portalToDungeon, DUNGEON_ENTRANCE + Vector3.new(0, 0, -12))
@@ -1923,9 +2647,8 @@ local function ensureTools(player)
 	end
 	if not hasTool("Sword") then
 		local sword = createSword(player)
-		local tier = getStat(player, "Stats", "SwordTier")
-		if tier then styleSword(sword, tier.Value) end
 		sword.Parent = backpack
+		restylePlayerSword(player)
 	end
 	if not hasTool("Fireball") then createFireballTool(player).Parent = backpack end
 	if not hasTool("Drink Potion") then createPotionTool(player).Parent = backpack end
@@ -1933,9 +2656,8 @@ end
 
 local function onCharacterAdded(player, character)
 	local humanoid = character:WaitForChild("Humanoid", 10)
-	local level = getStat(player, "leaderstats", "Level")
-	if humanoid and level then
-		humanoid.MaxHealth = 100 + (level.Value - 1) * 20
+	if humanoid then
+		humanoid.MaxHealth = maxHealthFor(player)
 		humanoid.Health = humanoid.MaxHealth
 	end
 	local hrp = character:WaitForChild("HumanoidRootPart", 10)
@@ -1944,6 +2666,10 @@ local function onCharacterAdded(player, character)
 		hrp.CFrame = townSpawnCFrame
 	end
 	ensureTools(player)
+	-- re-apply gear on the fresh character: HP cap, walk speed,
+	-- worn visuals and the sword's rarity styling
+	applyGear(player)
+	sendMusic(player)
 end
 
 --====================================================================
@@ -1962,6 +2688,25 @@ local function savePlayer(player)
 	for _, name in ipairs(SAVE_STATS) do
 		local v = getStat(player, "Stats", name)
 		if v then data[name] = v.Value end
+	end
+	-- equipment: plain serializable copies (ids are re-issued on load)
+	local state = gearState[player]
+	if state then
+		local function copyItem(item)
+			if not item then return nil end
+			return {
+				slot = item.slot, rarity = item.rarity,
+				name = item.name, stat = item.stat,
+			}
+		end
+		local gearData = { inv = {}, equipped = {} }
+		for _, item in ipairs(state.inv) do
+			table.insert(gearData.inv, copyItem(item))
+		end
+		for slot, item in pairs(state.equipped) do
+			gearData.equipped[slot] = copyItem(item)
+		end
+		data.Gear = gearData
 	end
 	local ok, err = pcall(function()
 		saveStore:SetAsync("player_" .. player.UserId, data)
@@ -1997,10 +2742,47 @@ local function loadPlayer(player)
 	apply("Stats", "SwordTier", data.SwordTier, 1, MAX_SWORD_TIER)
 	apply("Stats", "Armor", data.Armor, 0, MAX_ARMOR)
 	apply("Stats", "Power", data.Power, 0, 100000000)
+	-- equipment restore (validated against the slot/rarity tables)
+	local state = gearState[player]
+	if state and type(data.Gear) == "table" then
+		local function revive(raw)
+			if type(raw) ~= "table" then return nil end
+			if not STAT_BANDS[raw.slot] or not RARITIES[raw.rarity] then return nil end
+			if type(raw.name) ~= "string" or type(raw.stat) ~= "number" then return nil end
+			local band = STAT_BANDS[raw.slot][raw.rarity]
+			gearIdCounter = gearIdCounter + 1
+			return {
+				id = "g" .. gearIdCounter,
+				slot = raw.slot,
+				rarity = raw.rarity,
+				name = string.sub(raw.name, 1, 60),
+				stat = math.clamp(math.floor(raw.stat), 1, band[2] * 2),
+			}
+		end
+		if type(data.Gear.inv) == "table" then
+			for _, raw in ipairs(data.Gear.inv) do
+				local item = revive(raw)
+				if item and #state.inv < MAX_INVENTORY then
+					table.insert(state.inv, item)
+				end
+			end
+		end
+		if type(data.Gear.equipped) == "table" then
+			for _, slot in ipairs(GEAR_SLOTS) do
+				local item = revive(data.Gear.equipped[slot])
+				if item and item.slot == slot then
+					state.equipped[slot] = item
+				end
+			end
+		end
+	end
 end
 
 local function onPlayerAdded(player)
 	lastAction[player] = { sword = 0, fire = 0, potion = 0, teleport = 0 }
+	gearState[player] = { inv = {}, equipped = {} }
+	bagOpen[player] = false
+	musicMode[player] = "Auto"
 
 	local function makeInt(parent, name, value)
 		local v = Instance.new("IntValue")
@@ -2024,20 +2806,26 @@ local function onPlayerAdded(player)
 	makeInt(stats, "SwordTier", 1)
 	makeInt(stats, "Armor", 0)
 	makeInt(stats, "Power", 0)
+	makeInt(stats, "GearATK", 0)
+	makeInt(stats, "GearDEF", 0)
 	stats.Parent = player
 
 	-- Load saved progress BEFORE the character setup below reads Level
 	loadPlayer(player)
 
 	buildHUD(player)
+	buildBagUI(player)
 
 	local backpack = player:WaitForChild("Backpack")
 	local startSword = createSword(player)
-	local loadedTier = getStat(player, "Stats", "SwordTier")
-	if loadedTier then styleSword(startSword, loadedTier.Value) end
 	startSword.Parent = backpack
 	createFireballTool(player).Parent = backpack
 	createPotionTool(player).Parent = backpack
+	-- restored gear (if any) takes effect: bonuses, sword styling,
+	-- worn visuals (character may spawn a moment later; CharacterAdded
+	-- re-applies everything then)
+	applyGear(player)
+	sendMusic(player, true)
 
 	if player.Character then
 		onCharacterAdded(player, player.Character)
@@ -2055,6 +2843,13 @@ Players.PlayerRemoving:Connect(function(player)
 	savePlayer(player)
 	lastAction[player] = nil
 	saveReady[player] = nil
+	gearState[player] = nil
+	bagOpen[player] = nil
+	bagRefs[player] = nil
+	musicMode[player] = nil
+	sentTrack[player] = nil
+	lastMusicSent[player] = nil
+	toastToken[player] = nil
 end)
 
 game:BindToClose(function()
@@ -2120,4 +2915,16 @@ task.spawn(function()
 	end
 end)
 
-print("[ShiningSoul] v3 server started: art pass + terrain zones (campfires / lava) ready.")
+-- MUSIC LOOP (2s): Auto mode follows the player's zone; also forces
+-- a re-send every ~14s so a client that loaded late still gets music.
+task.spawn(function()
+	while true do
+		task.wait(2)
+		for _, player in ipairs(Players:GetPlayers()) do
+			local stale = (os.clock() - (lastMusicSent[player] or 0)) > 14
+			pcall(sendMusic, player, stale)
+		end
+	end
+end)
+
+print("[ShiningSoul] v4 server started: equipment system + SFX + selectable BGM ready.")
