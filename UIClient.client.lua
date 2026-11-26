@@ -4,7 +4,7 @@
 --   Explorer -> StarterPlayerScripts -> + -> LocalScript
 --   (delete the default line, paste this in -- only ever done once)
 --
--- It does three jobs the server script cannot do by itself:
+-- It does four jobs the server script cannot do by itself:
 --   1) Forwards clicks: every GuiButton the server builds carries
 --      "Act" / "Arg" attributes; clicks are sent to the server on
 --      the UIEvent RemoteEvent (bag, equip, class, skills, music).
@@ -12,6 +12,10 @@
 --   3) Plays background music: the server says which track to play
 --      ("Calm" / "Battle" / "Off") and this script runs one looped
 --      Sound in SoundService.
+--   4) (v8) Forwards CHARGE input: hold left mouse / touch ->
+--      ("Charge", "Begin"), release -> ("Charge", "Release").
+--      The server validates a weapon tool is equipped before a
+--      charge starts, so clicks on empty hands are ignored there.
 --====================================================================
 
 local Players = game:GetService("Players")
@@ -87,5 +91,33 @@ UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
 	local arg = HOTKEYS[input.KeyCode]
 	if arg then
 		uiEvent:FireServer("CastSkill", arg)
+	end
+end)
+
+-- Charge attacks (v8): HOLD left mouse / touch to charge, release
+-- to fire the class charge attack. The press ALSO fires the tool's
+-- normal Activated swing -- that is the intended wind-up (see the
+-- server README: tier-0 release adds nothing because the swing
+-- already happened). Known touch tradeoff: on touch devices a
+-- camera-drag touch also sends Begin; the server still requires
+-- an equipped weapon, and releasing the drag fires the charge.
+local chargeHeld = false
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		if not chargeHeld then
+			chargeHeld = true
+			uiEvent:FireServer("Charge", "Begin")
+		end
+	end
+end)
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		if chargeHeld then
+			chargeHeld = false
+			uiEvent:FireServer("Charge", "Release")
+		end
 	end
 end)
