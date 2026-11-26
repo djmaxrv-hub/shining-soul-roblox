@@ -1,8 +1,25 @@
 --====================================================================
--- Shining Soul-type 3D ARPG for Roblox -- v5 (single-file server)
+-- Shining Soul-type 3D ARPG for Roblox -- v6 (single-file server)
 -- Paste this whole file into ONE Script in ServerScriptService.
 -- Everything (map, enemies, tools, HUD, shop, waves) is built and
 -- wired up at runtime by this script. No child scripts are used.
+-- v6: MONSTER SKILLS + BIGGER MAP. Every enemy type now has a real
+--     attack pattern instead of walking into the player: Slimes hop
+--     and do a telegraphed LEAP attack, Goblins wind up and DASH,
+--     Skeletons KITE at range and shoot bone projectiles, Elites do
+--     a telegraphed ground SLAM, and the Skeleton King has a big
+--     slam, HP-threshold SUMMONS, a bone VOLLEY fan and an ENRAGE
+--     below 30% HP. All enemy projectiles are physical parts moved
+--     in a fast loop and can be dodged. MAP: the town is now a
+--     designed NON-COMBAT hub (Class Mentor NPC that re-opens the
+--     class panel, 3 training dummies that show damage numbers but
+--     never die or pay out, a controls notice board, bench +
+--     campfire corner, flower beds, street houses, bigger plaza);
+--     a dressed FIELD (road, pond, fences, mid-field campfire,
+--     leashed wandering slimes) connects the town gate to a stone
+--     DUNGEON GATE ARCH -- walk through the arch to enter the
+--     dungeon, and the dungeon return portal lands back at the
+--     arch. A rock-mountain + tree ring bounds the whole world.
 -- v5: CLASS system -- four Diablo-2-inspired classes (Warrior /
 --     Mage / Archer / Paladin), each with its own tool loadout and
 --     3 upgradable skills (levels 0-5). 1 skill point per level-up;
@@ -203,6 +220,7 @@ end
 -- Forward declarations: defined in the equipment section further
 -- down, but referenced by earlier code (enemy death, level-ups).
 local spawnGearDrop -- (position, rarityWeights) -> spawns a gear drop
+local spawnFieldSlime -- (homePosition) -> v6 field wildlife spawner
 local maxHealthFor -- (player) -> max HP incl. level + helmet bonus
 -- Class system (v5), defined in the class section further down:
 local classDamageMul -- (player, "melee"|"spell"|"ranged") -> outgoing damage multiplier
@@ -751,22 +769,29 @@ local portalToDungeon = nil
 local portalToTown = nil
 
 local function buildPortals(town, dg)
-	portalToDungeon = makePart(town, "PortalToDungeon", Vector3.new(7, 9, 1),
-		CFrame.new(TOWN_CENTER.X, 4.5, TOWN_CENTER.Z - 48),
+	-- v6: the dungeon portal moved OUT of town to the stone DUNGEON
+	-- GATE ARCH at the far end of the field (z = -56). Walking
+	-- through the arch teleports into the dungeon, same as the old
+	-- town pad did. (Parts are still parented to the town folder;
+	-- folders here are purely organizational.)
+	portalToDungeon = makePart(town, "PortalToDungeon", Vector3.new(8, 10, 1),
+		CFrame.new(0, 5, -56),
 		Color3.fromRGB(160, 60, 255), Enum.Material.Neon)
 	portalToDungeon.CanCollide = false
 	portalToDungeon.Transparency = 0.25
-	-- stone frame around the dungeon portal: 2 pillars + top beam
-	local pz = TOWN_CENTER.Z - 48
-	for _, px in ipairs({-4.6, 4.6}) do
-		makePart(town, "PortalPillar", Vector3.new(1.8, 11, 1.8), CFrame.new(px, 5.5, pz),
-			Color3.fromRGB(105, 100, 115), Enum.Material.Slate)
-		local cap = makePart(town, "PortalPillarCap", Vector3.new(2.4, 2.4, 2.4),
-			CFrame.new(px, 11.6, pz), Color3.fromRGB(170, 90, 255), Enum.Material.Neon)
+	-- the gate arch itself: two chunky stone pillars + beam + caps
+	local pz = -56
+	for _, px in ipairs({-5.6, 5.6}) do
+		makePart(town, "GateArchPillar", Vector3.new(2.6, 13, 2.6), CFrame.new(px, 6.5, pz),
+			Color3.fromRGB(100, 96, 110), Enum.Material.Slate)
+		makePart(town, "GateArchBase", Vector3.new(3.6, 1.6, 3.6), CFrame.new(px, 0.8, pz),
+			Color3.fromRGB(85, 82, 95), Enum.Material.Slate)
+		local cap = makePart(town, "GateArchCap", Vector3.new(2.4, 2.4, 2.4),
+			CFrame.new(px, 13.8, pz), Color3.fromRGB(170, 90, 255), Enum.Material.Neon)
 		cap.Shape = Enum.PartType.Ball
 	end
-	makePart(town, "PortalBeam", Vector3.new(11.5, 1.6, 1.8), CFrame.new(0, 10.6, pz),
-		Color3.fromRGB(105, 100, 115), Enum.Material.Slate)
+	makePart(town, "GateArchBeam", Vector3.new(14.5, 2, 2.6), CFrame.new(0, 12.4, pz),
+		Color3.fromRGB(100, 96, 110), Enum.Material.Slate)
 	local pLight = Instance.new("PointLight")
 	pLight.Color = Color3.fromRGB(180, 100, 255)
 	pLight.Range = 28
@@ -808,6 +833,263 @@ local function inDungeon(pos)
 	return math.abs(pos.X - DUNGEON_CENTER.X) <= DUNGEON_HALF_X + 8
 		and math.abs(pos.Z - DUNGEON_CENTER.Z) <= DUNGEON_HALF_Z + 8
 end
+
+--====================================================================
+-- v6 MAP EXPANSION: bigger world. The TOWN becomes a designed
+-- NON-COMBAT hub (mentor, training dummies, notice board, social
+-- corner, flower beds, street houses, bigger plaza); a dressed
+-- FIELD (road, pond, fences, mid-field campfire) runs from the
+-- town gate to the dungeon gate arch; a mountain ring bounds the
+-- world. Travel loop: town -> field -> arch -> dungeon -> field.
+--====================================================================
+local mentorStandPart = nil
+
+-- Campfire site builder (visual twin of the dungeon campfires in
+-- buildDungeon; registers the position so the zone loop heals
+-- players standing nearby -- the town social corner included).
+local function buildCampfireSite(parent, fx, fz)
+	local g = Instance.new("Folder")
+	g.Name = "CampfireSite"
+	g.Parent = parent
+	local ring = makePart(g, "CampfireRing", Vector3.new(0.3, 14.6, 14.6),
+		CFrame.new(fx, 0.32, fz) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(90, 255, 170), Enum.Material.Neon)
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Transparency = 0.78
+	ring.CanCollide = false
+	for i = 1, 8 do
+		local a = (i / 8) * math.pi * 2
+		local stone = makePart(g, "RingStone", Vector3.new(1.1, 0.9, 1.1),
+			CFrame.new(fx + math.cos(a) * 2.6, 0.45, fz + math.sin(a) * 2.6),
+			Color3.fromRGB(120, 118, 112), Enum.Material.Slate)
+		stone.Shape = Enum.PartType.Ball
+	end
+	for i = 1, 3 do
+		local a = (i / 3) * math.pi * 2
+		local log = makePart(g, "Log", Vector3.new(3.2, 0.55, 0.55),
+			CFrame.new(fx, 0.5, fz) * CFrame.Angles(math.rad(65), a, 0),
+			Color3.fromRGB(95, 62, 35), Enum.Material.Wood)
+		log.Shape = Enum.PartType.Cylinder
+	end
+	local flame = makePart(g, "Campfire", Vector3.new(1.8, 2.4, 1.8),
+		CFrame.new(fx, 1.5, fz), Color3.fromRGB(255, 150, 60), Enum.Material.Neon)
+	flame.Shape = Enum.PartType.Ball
+	flame.CanCollide = false
+	local fl = Instance.new("PointLight")
+	fl.Color = Color3.fromRGB(255, 170, 90)
+	fl.Range = 24
+	fl.Brightness = 2.5
+	fl.Parent = flame
+	local em = Instance.new("ParticleEmitter")
+	em.Texture = "rbxasset://textures/particles/fire_main.dds"
+	em.Rate = 20
+	em.Lifetime = NumberRange.new(0.4, 0.9)
+	em.Speed = NumberRange.new(2, 4)
+	em.Size = NumberSequence.new({ NumberSequenceKeypoint.new(0, 1.1),
+		NumberSequenceKeypoint.new(1, 0) })
+	em.Color = ColorSequence.new(Color3.fromRGB(255, 180, 80))
+	em.LightEmission = 1
+	em.Parent = flame
+	table.insert(campfirePositions, Vector3.new(fx, 0, fz))
+end
+
+local function buildWorldV6()
+	-- base ground under the whole world (top at y = -0.12, below
+	-- the town / field / dungeon slabs so nothing z-fights)
+	makePart(mapFolder, "WorldGround", Vector3.new(380, 2, 420),
+		CFrame.new(0, -1.12, 10), Color3.fromRGB(86, 146, 72), Enum.Material.Grass)
+
+	-- FIELD ground strip: town gate (z=34) down to the dungeon
+	-- walls (z=-64). Top at y=-0.03, just under the town slab.
+	makePart(mapFolder, "FieldGround", Vector3.new(140, 2, 74),
+		CFrame.new(0, -1.03, -27), Color3.fromRGB(102, 165, 82), Enum.Material.Grass)
+	-- the road: town gate -> gate arch
+	makePart(mapFolder, "FieldRoad", Vector3.new(8, 0.3, 96),
+		CFrame.new(0, 0.22, -12), Color3.fromRGB(160, 150, 135), Enum.Material.Cobblestone)
+
+	-- pond (east side of the field)
+	local rim = makePart(mapFolder, "PondRim", Vector3.new(0.5, 21, 21),
+		CFrame.new(34, 0.1, -24) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(125, 122, 115), Enum.Material.Slate)
+	rim.Shape = Enum.PartType.Cylinder
+	local pond = makePart(mapFolder, "Pond", Vector3.new(0.3, 18, 18),
+		CFrame.new(34, 0.3, -24) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(70, 160, 255), Enum.Material.Glass)
+	pond.Shape = Enum.PartType.Cylinder
+	pond.Transparency = 0.3
+	pond.CanCollide = false
+
+	-- split-rail fences flanking the road (with gaps to walk out)
+	local fenceColor = Color3.fromRGB(110, 80, 50)
+	local function fieldFence(x, z1, z2)
+		local len = math.abs(z2 - z1)
+		local midZ = (z1 + z2) / 2
+		for _, ry in ipairs({1, 1.9}) do
+			makePart(mapFolder, "FieldFenceRail", Vector3.new(0.25, 0.32, len),
+				CFrame.new(x, ry, midZ), fenceColor, Enum.Material.Wood)
+		end
+		local posts = math.max(2, math.floor(len / 9) + 1)
+		for i = 0, posts - 1 do
+			local t = (posts == 1) and 0 or i / (posts - 1)
+			makePart(mapFolder, "FieldFencePost", Vector3.new(0.6, 2.6, 0.6),
+				CFrame.new(x, 1.3, z1 + (z2 - z1) * t), fenceColor, Enum.Material.Wood)
+		end
+	end
+	fieldFence(-6.5, 24, -4)
+	fieldFence(6.5, 24, -4)
+	fieldFence(-6.5, -20, -44)
+	fieldFence(6.5, -20, -44)
+
+	-- field dressing: trees + rocks
+	buildTree(mapFolder, -20, -12)
+	buildTree(mapFolder, 24, -40)
+	buildTree(mapFolder, -38, -30)
+	buildTree(mapFolder, 48, -6)
+	buildTree(mapFolder, -54, -52)
+	buildTree(mapFolder, 54, -50)
+	buildTree(mapFolder, 16, 2)
+	buildTree(mapFolder, -30, -56)
+	local function fieldRock(rx, rz, s)
+		local r = makePart(mapFolder, "FieldRock", Vector3.new(s, s * 0.7, s * 0.85),
+			CFrame.new(rx, s * 0.28, rz) * CFrame.Angles(0, math.rad(rx * 5), 0),
+			Color3.fromRGB(108, 106, 112), Enum.Material.Slate)
+		r.Shape = Enum.PartType.Ball
+	end
+	fieldRock(-14, -34, 3)
+	fieldRock(20, -16, 2.4)
+	fieldRock(-44, -16, 3.6)
+	fieldRock(44, -44, 2.8)
+
+	-- mid-field campfire (heals, via the zone loop)
+	buildCampfireSite(mapFolder, 11, -14)
+
+	-- WAYPOINT STONE where the old in-town portal used to stand:
+	-- pure decoration now (the real portal is the field arch)
+	local stone = makePart(mapFolder, "WaypointStone", Vector3.new(2.2, 5.2, 2.2),
+		CFrame.new(8, 2.6, 30) * CFrame.Angles(math.rad(4), math.rad(20), 0),
+		Color3.fromRGB(105, 102, 112), Enum.Material.Slate)
+	local rune = makePart(mapFolder, "WaypointRune", Vector3.new(0.25, 3, 3),
+		CFrame.new(8, 3.4, 28.6) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(170, 90, 255), Enum.Material.Neon)
+	rune.Shape = Enum.PartType.Cylinder
+	rune.CanCollide = false
+	local runeLight = Instance.new("PointLight")
+	runeLight.Color = Color3.fromRGB(180, 100, 255)
+	runeLight.Range = 16
+	runeLight.Brightness = 1.5
+	runeLight.Parent = rune
+
+	-- TOWN: bigger plaza (resize the parts buildTown already made)
+	local plaza = townFolder:FindFirstChild("Plaza")
+	if plaza then plaza.Size = Vector3.new(0.4, 64, 64) end
+	local trim = townFolder:FindFirstChild("PlazaTrim")
+	if trim then trim.Size = Vector3.new(0.25, 68, 68) end
+
+	-- TOWN: Class Mentor on a podium (east side of the plaza).
+	-- The ProximityPrompt is wired later in setupMentor().
+	local podium = makePart(townFolder, "MentorPodium", Vector3.new(1, 9.5, 9.5),
+		CFrame.new(26, 0.5, 92) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(150, 148, 142), Enum.Material.Marble)
+	podium.Shape = Enum.PartType.Cylinder
+	makePart(townFolder, "MentorBody", Vector3.new(2.2, 3.2, 1.1),
+		CFrame.new(26, 2.6, 92), Color3.fromRGB(110, 60, 170), Enum.Material.SmoothPlastic)
+	local mHead = makePart(townFolder, "MentorHead", Vector3.new(1.7, 1.7, 1.7),
+		CFrame.new(26, 5, 92), Color3.fromRGB(240, 200, 160), Enum.Material.SmoothPlastic)
+	mHead.Shape = Enum.PartType.Ball
+	local mHat = makePart(townFolder, "MentorHat", Vector3.new(0.5, 2.6, 2.6),
+		CFrame.new(26, 6.1, 92) * CFrame.Angles(0, 0, math.rad(90)),
+		Color3.fromRGB(80, 40, 130), Enum.Material.SmoothPlastic)
+	mHat.Shape = Enum.PartType.Cylinder
+	makePart(townFolder, "MentorStaff", Vector3.new(0.3, 6.4, 0.3),
+		CFrame.new(27.6, 3.4, 92), Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+	local mOrb = makePart(townFolder, "MentorOrb", Vector3.new(1, 1, 1),
+		CFrame.new(27.6, 6.9, 92), Color3.fromRGB(150, 100, 255), Enum.Material.Neon)
+	mOrb.Shape = Enum.PartType.Ball
+	local nameGui = Instance.new("BillboardGui")
+	nameGui.Name = "MentorName"
+	nameGui.Size = UDim2.new(6, 0, 1, 0)
+	nameGui.StudsOffset = Vector3.new(0, 2.2, 0)
+	nameGui.AlwaysOnTop = true
+	nameGui.Parent = mHead
+	local nl = makeLabel(nameGui, "NameLabel", UDim2.fromScale(1, 1), UDim2.fromScale(0, 0),
+		"Class Mentor", 16, Color3.fromRGB(210, 170, 255))
+	nl.TextXAlignment = Enum.TextXAlignment.Center
+	mentorStandPart = makePart(townFolder, "MentorStand", Vector3.new(3, 2, 3),
+		CFrame.new(26, 1, 87.5), Color3.fromRGB(255, 205, 80), Enum.Material.SmoothPlastic)
+
+	-- TOWN: notice board by the gate with the basic controls
+	for _, px in ipairs({-17, -5}) do
+		makePart(townFolder, "BoardPost", Vector3.new(0.6, 5.5, 0.6),
+			CFrame.new(px, 2.75, 40), Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+	end
+	local board = makePart(townFolder, "NoticeBoard", Vector3.new(13.5, 6, 0.4),
+		CFrame.new(-11, 4.4, 40), Color3.fromRGB(120, 88, 52), Enum.Material.Wood)
+	local bgui = Instance.new("SurfaceGui")
+	bgui.Face = Enum.NormalId.Front
+	bgui.Parent = board
+	local bl = makeLabel(bgui, "BoardText", UDim2.fromScale(0.94, 0.92),
+		UDim2.fromScale(0.03, 0.04),
+		"HOW TO PLAY\nMove: WASD   |   Attack: 1 (sword / bow)\nSkills: Q  E  R  -- open the Class panel to upgrade\nBag & gear: the Bag button   |   Shops: the two stalls\nDungeon: north gate -> field -> purple arch", 20,
+		Color3.fromRGB(255, 240, 200))
+	bl.TextWrapped = true
+	bl.TextXAlignment = Enum.TextXAlignment.Center
+	bl.TextYAlignment = Enum.TextYAlignment.Top
+
+	-- TOWN: bench + campfire social corner (south-west, heals)
+	buildCampfireSite(townFolder, -36, 112)
+	makePart(townFolder, "BenchSeat", Vector3.new(6.5, 0.4, 1.9),
+		CFrame.new(-36, 1.15, 118.5), Color3.fromRGB(115, 80, 48), Enum.Material.Wood)
+	makePart(townFolder, "BenchBack", Vector3.new(6.5, 1.9, 0.35),
+		CFrame.new(-36, 2.3, 119.5), Color3.fromRGB(115, 80, 48), Enum.Material.Wood)
+	for _, bx in ipairs({-38.6, -33.4}) do
+		makePart(townFolder, "BenchLeg", Vector3.new(0.5, 1.1, 1.7),
+			CFrame.new(bx, 0.55, 118.5), Color3.fromRGB(90, 62, 38), Enum.Material.Wood)
+	end
+
+	-- TOWN: flower beds around the plaza
+	local flowerColors = {
+		Color3.fromRGB(255, 90, 120), Color3.fromRGB(255, 200, 70),
+		Color3.fromRGB(190, 110, 255), Color3.fromRGB(255, 130, 60),
+		Color3.fromRGB(120, 220, 255),
+	}
+	for _, spot in ipairs({ {14, 64}, {-14, 64}, {14, 96}, {-14, 96} }) do
+		local fx, fz = spot[1], spot[2]
+		makePart(townFolder, "Planter", Vector3.new(7.5, 1, 3.2),
+			CFrame.new(fx, 0.5, fz), Color3.fromRGB(105, 74, 44), Enum.Material.Wood)
+		makePart(townFolder, "PlanterSoil", Vector3.new(7, 0.3, 2.7),
+			CFrame.new(fx, 1.05, fz), Color3.fromRGB(70, 50, 32), Enum.Material.Slate)
+		for i = 1, 5 do
+			local fl = makePart(townFolder, "Flower", Vector3.new(0.55, 0.55, 0.55),
+				CFrame.new(fx - 3 + (i - 1) * 1.5, 1.45, fz + ((i % 2 == 0) and 0.6 or -0.6)),
+				flowerColors[i], Enum.Material.Neon)
+			fl.Shape = Enum.PartType.Ball
+			fl.CanCollide = false
+		end
+	end
+
+	-- TOWN: street houses outside the fence (on the town slab)
+	buildHouse(townFolder, -62, TOWN_CENTER.Z + 34, Color3.fromRGB(190, 175, 160))
+	buildHouse(townFolder, 62, TOWN_CENTER.Z + 30, Color3.fromRGB(175, 165, 195))
+	buildHouse(townFolder, -64, TOWN_CENTER.Z - 34, Color3.fromRGB(185, 195, 175))
+	buildHouse(townFolder, 64, TOWN_CENTER.Z - 38, Color3.fromRGB(205, 180, 150))
+
+	-- WORLD BOUNDARY: ring of rock mountains + pines, so the map
+	-- reads as a place instead of an endless plate
+	for i = 0, 19 do
+		local a = (i / 20) * math.pi * 2
+		local mx, mz = math.cos(a) * 168, 5 + math.sin(a) * 168
+		local s = 46 + (i % 3) * 11
+		local rock = makePart(mapFolder, "BoundaryRock",
+			Vector3.new(s, s * 0.62, s * 0.9),
+			CFrame.new(mx, s * 0.16, mz) * CFrame.Angles(0, a, 0),
+			Color3.fromRGB(96 + (i % 3) * 6, 94 + (i % 3) * 5, 104), Enum.Material.Slate)
+		rock.Shape = Enum.PartType.Ball
+		if i % 3 == 0 then
+			buildTree(mapFolder, math.cos(a) * 146, 5 + math.sin(a) * 146)
+		end
+	end
+end
+buildWorldV6()
 
 --====================================================================
 -- PLAYER DATA + HUD
@@ -1221,6 +1503,8 @@ end
 
 local function onEnemyDeath(model, data)
 	enemies[model] = nil
+	-- v6: training dummies never pay out and never drop anything
+	if data.isDummy then return end
 	local killer = nil
 	if data.lastDamager then
 		killer = Players:GetPlayerByUserId(data.lastDamager)
@@ -1263,6 +1547,13 @@ local function onEnemyDeath(model, data)
 		elseif roll < 0.45 then
 			spawnPickup("HealOrb", root.Position)
 		end
+	end
+	-- v6: field wildlife respawns at its home point 10s later
+	if data.isField and data.home then
+		local home = data.home
+		task.delay(10, function()
+			spawnFieldSlime(home)
+		end)
 	end
 end
 
@@ -1344,6 +1635,11 @@ local function damageEnemy(model, amount, attacker, knockbackDir)
 	if not humanoid or humanoid.Health <= 0 then return end
 	if attacker then data.lastDamager = attacker.UserId end
 	humanoid:TakeDamage(amount)
+	-- v6: training dummies silently reset HP after every hit -- the
+	-- damage number / flash / sparks still show, they just never die
+	if data.isDummy then
+		humanoid.Health = humanoid.MaxHealth
+	end
 	local root = model:FindFirstChild("HumanoidRootPart")
 	if root then
 		spawnDamageNumber(root, amount)
@@ -1420,6 +1716,31 @@ local function spawnEnemy(kind, position, difficultyScale)
 		bodyPart = bodyPart,
 		baseBodySize = bodyPart and bodyPart.Size or nil,
 		phase = math.random() * math.pi * 2,
+		-- v6: zone tag drives wave counting + leashing. "Dungeon"
+		-- enemies count toward wave clear; "Field" wildlife and
+		-- "Town" dummies never do.
+		zone = "Dungeon",
+		isDummy = false,
+		isField = false,
+		home = nil,
+		summoned = false,
+		-- v6 AI state machine (see the behavior section below)
+		ai = {
+			busy = false,          -- a dash / leap task owns movement
+			touchCd = 0,           -- contact / melee damage cooldown
+			leapNext = os.clock() + 2 + math.random() * 2,
+			dashNext = os.clock() + 1.5 + math.random() * 1.5,
+			strafeNext = 0,
+			strafeUntil = 0,
+			strafeDir = 1,
+			recoverUntil = 0,
+			shootNext = os.clock() + 1.2 + math.random(),
+			slamNext = os.clock() + 4 + math.random() * 3,
+			volleyNext = os.clock() + 3 + math.random() * 2,
+			summoned66 = false,
+			summoned33 = false,
+			enraged = false,
+		},
 	}
 	enemies[model] = data
 	humanoid.Died:Connect(function()
@@ -1462,6 +1783,106 @@ local function spawnEnemy(kind, position, difficultyScale)
 end
 
 --====================================================================
+-- v6: TRAINING DUMMIES + FIELD WILDLIFE spawners
+--====================================================================
+-- A training dummy is an entry in the enemies table (so every
+-- weapon / skill damage path works on it and shows damage numbers,
+-- hit flash and sparks) flagged isDummy: damageEnemy tops its HP
+-- back up after every hit, onEnemyDeath pays nothing, the AI loop
+-- ignores it, and aliveEnemyCount never counts it.
+local function spawnTrainingDummy(position)
+	local model = Instance.new("Model")
+	model.Name = "TrainingDummy"
+	local root = Instance.new("Part")
+	root.Name = "HumanoidRootPart"
+	root.Size = Vector3.new(2, 2, 1)
+	root.CFrame = CFrame.new(position.X, position.Y + 2.6, position.Z)
+	root.Transparency = 1
+	root.CanCollide = true
+	root.Anchored = true
+	root.Parent = model
+	local humanoid = Instance.new("Humanoid")
+	humanoid.MaxHealth = 100000
+	humanoid.Health = humanoid.MaxHealth
+	humanoid.WalkSpeed = 0
+	humanoid.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+	humanoid.Parent = model
+	model.PrimaryPart = root
+	model.Parent = enemiesFolder
+	local function add(name, size, offset, color, material, shape)
+		local p = Instance.new("Part")
+		p.Name = name
+		p.Size = size
+		p.Color = color
+		p.Material = material or Enum.Material.SmoothPlastic
+		if shape then p.Shape = shape end
+		p.CFrame = root.CFrame * CFrame.new(offset)
+		p.Anchored = true
+		p.CanCollide = false
+		p.Parent = model
+		return p
+	end
+	local hay = Color3.fromRGB(216, 182, 92)
+	-- round base + post + crossbar arms + stuffed body + head
+	local base = add("Base", Vector3.new(0.5, 3.6, 3.6), Vector3.new(0, -2.35, 0),
+		Color3.fromRGB(105, 100, 95), Enum.Material.Slate, Enum.PartType.Cylinder)
+	base.CFrame = root.CFrame * CFrame.new(0, -2.35, 0) * CFrame.Angles(0, 0, math.rad(90))
+	add("Post", Vector3.new(0.55, 3.4, 0.55), Vector3.new(0, -0.6, 0),
+		Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+	add("Crossbar", Vector3.new(3.6, 0.45, 0.45), Vector3.new(0, 0.75, 0),
+		Color3.fromRGB(100, 70, 40), Enum.Material.Wood)
+	local body = add("Body", Vector3.new(2.1, 2.6, 1.3), Vector3.new(0, 0.1, 0),
+		hay, Enum.Material.Fabric)
+	add("Belt", Vector3.new(2.25, 0.4, 1.45), Vector3.new(0, -0.7, 0),
+		Color3.fromRGB(140, 60, 45), Enum.Material.Leather)
+	add("HeadVisual", Vector3.new(1.4, 1.4, 1.4), Vector3.new(0, 2, 0),
+		hay, Enum.Material.Fabric, Enum.PartType.Ball)
+	for _, ex in ipairs({-0.3, 0.3}) do
+		add("Eye", Vector3.new(0.18, 0.18, 0.1), Vector3.new(ex, 2.1, -0.66),
+			Color3.fromRGB(20, 20, 20), Enum.Material.Neon, Enum.PartType.Ball)
+	end
+	local data = {
+		kind = "Dummy",
+		damage = 0,
+		speed = 0,
+		xp = 0,
+		gold = 0,
+		lastAttack = 0,
+		lastDamager = nil,
+		isBoss = false,
+		isElite = false,
+		flashing = false,
+		bodyPart = body,
+		baseBodySize = body.Size,
+		phase = 0,
+		zone = "Town",
+		isDummy = true,
+		isField = false,
+		home = nil,
+		summoned = false,
+		ai = { busy = false, touchCd = 0 },
+	}
+	enemies[model] = data
+	makeHealthBar(model, root, "Training Dummy", 1)
+	return model
+end
+
+-- Field wildlife: a normal slime (full XP/gold on death) tagged as
+-- Field zone so waves ignore it; leashed to its home in the AI.
+spawnFieldSlime = function(homePosition)
+	local model = spawnEnemy("Slime", homePosition, 0.8)
+	if model then
+		local data = enemies[model]
+		if data then
+			data.zone = "Field"
+			data.isField = true
+			data.home = homePosition
+		end
+	end
+	return model
+end
+
+--====================================================================
 -- WAVE SYSTEM
 --====================================================================
 local waveActive = false
@@ -1479,8 +1900,14 @@ local function playersInDungeon()
 end
 
 local function aliveEnemyCount()
+	-- v6: only dungeon-zone, non-dummy enemies gate wave progress
+	-- (field wildlife and town dummies must never block a wave clear)
 	local n = 0
-	for _ in pairs(enemies) do n = n + 1 end
+	for _, data in pairs(enemies) do
+		if not data.isDummy and data.zone ~= "Field" then
+			n = n + 1
+		end
+	end
 	return n
 end
 
@@ -1552,79 +1979,589 @@ local function waveLoop()
 end
 
 --====================================================================
--- ENEMY AI LOOP
+-- ENEMY AI (v6): per-type behavior state machines. Enemies no
+-- longer just walk into the player:
+--   Slime    -- hopper; telegraphed LEAP attack every ~3.5s
+--   Goblin   -- fast approach, wind-up + DASH strike, strafes
+--   Skeleton -- ranged KITER, bone projectiles, weak melee + retreat
+--   Elites   -- periodic telegraphed ground SLAM
+--   Boss     -- big SLAM, HP-threshold SUMMONS, bone VOLLEY, ENRAGE
+-- All enemy damage to players flows through damagePlayer() below,
+-- so Armor points, chest %, class reduction and Thorns all apply
+-- exactly as they did to the old contact hits. Telegraphs are flat
+-- pulsing red discs: leave the disc before it detonates to dodge.
+--====================================================================
+
+-- NOTE: these helpers live in ONE table on purpose -- the main
+-- chunk is close to Luau's 200-local-register limit.
+local AI = { projectiles = {} }
+
+-- Central enemy -> player damage path (extracted from the old
+-- contact-hit code so every attack type shares it).
+AI.damagePlayer = function(player, amount, sourceModel)
+	local character = player and player.Character
+	local phrp = getHRP(character)
+	local phum = getHumanoid(character)
+	if not phrp or not phum or phum.Health <= 0 then return end
+	local armor = getStat(player, "Stats", "Armor")
+	local armorPoints = armor and math.clamp(armor.Value, 0, MAX_ARMOR) or 0
+	local gearDEF = getStat(player, "Stats", "GearDEF")
+	local reduction = ARMOR_PER_POINT * armorPoints
+		+ (gearDEF and gearDEF.Value or 0) / 100
+	reduction = math.min(reduction, 0.75)
+	local incoming = amount * (1 - reduction) * classIncomingMul(player)
+	phum:TakeDamage(incoming)
+	playSfx("Hurt", phrp, true)
+	-- Thorns Aura (v5): reflect a fraction of the attacker's own
+	-- damage stat back at it (melee-range sources only).
+	if sourceModel then
+		local sdata = enemies[sourceModel]
+		local reflect = thornsReflectFor(player)
+		if sdata and reflect > 0 then
+			damageEnemy(sourceModel, sdata.damage * reflect, player, nil)
+		end
+	end
+end
+
+-- Expanding shockwave ring used by slams (local twin of ringFX,
+-- which is defined later in the file and out of scope here).
+AI.slamRingFX = function(position, radius, color)
+	local ring = Instance.new("Part")
+	ring.Name = "SlamRing"
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.35, 2, 2)
+	ring.CFrame = CFrame.new(position.X, 0.45, position.Z)
+		* CFrame.Angles(0, 0, math.rad(90))
+	ring.Color = color
+	ring.Material = Enum.Material.Neon
+	ring.Transparency = 0.25
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.Parent = Workspace
+	task.spawn(function()
+		local t0 = os.clock()
+		while ring.Parent do
+			local t = (os.clock() - t0) / 0.4
+			if t >= 1 then break end
+			local d = 2 + (radius * 2 - 2) * t
+			ring.Size = Vector3.new(0.35, d, d)
+			ring.Transparency = 0.25 + 0.75 * t
+			task.wait(0.03)
+		end
+		ring:Destroy()
+	end)
+end
+
+-- Telegraph disc: pulses red at `position` for `duration`, then
+-- detonates -- every player still inside takes `amount` damage
+-- from `sourceModel`. Fully avoidable by walking out.
+AI.spawnTelegraph = function(position, radius, duration, amount, sourceModel)
+	local disc = Instance.new("Part")
+	disc.Name = "Telegraph"
+	disc.Shape = Enum.PartType.Cylinder
+	disc.Size = Vector3.new(0.22, radius * 2, radius * 2)
+	disc.CFrame = CFrame.new(position.X, 0.42, position.Z)
+		* CFrame.Angles(0, 0, math.rad(90))
+	disc.Color = Color3.fromRGB(255, 60, 50)
+	disc.Material = Enum.Material.Neon
+	disc.Transparency = 0.55
+	disc.Anchored = true
+	disc.CanCollide = false
+	disc.Parent = Workspace
+	task.spawn(function()
+		local t0 = os.clock()
+		while disc.Parent and os.clock() - t0 < duration do
+			local pulse = 0.5 + 0.5 * math.sin(os.clock() * 14)
+			disc.Transparency = 0.35 + 0.35 * pulse
+			task.wait(0.04)
+		end
+		if disc.Parent then disc:Destroy() end
+	end)
+	task.delay(duration, function()
+		AI.slamRingFX(position, radius, Color3.fromRGB(255, 90, 60))
+		spawnSparks(position + Vector3.new(0, 1, 0))
+		spawnSparks(position + Vector3.new(0, 2, 0))
+		for _, player in ipairs(Players:GetPlayers()) do
+			local phrp = getHRP(player.Character)
+			local phum = getHumanoid(player.Character)
+			if phrp and phum and phum.Health > 0 then
+				if horizontalDistance(phrp.Position, position) <= radius
+					and math.abs(phrp.Position.Y - position.Y) < 9 then
+					AI.damagePlayer(player, amount, nil)
+				end
+			end
+		end
+	end)
+end
+
+--====================================================================
+-- ENEMY PROJECTILES: physical parts stepped in a fast loop with
+-- per-step distance checks (dodgeable, no tunneling at 0.05s steps)
+--====================================================================
+
+AI.spawnEnemyProjectile = function(fromPos, targetPos, speed, damage, sourceModel, color)
+	local dir = targetPos - fromPos
+	if dir.Magnitude < 0.1 then return end
+	dir = dir.Unit
+	local p = Instance.new("Part")
+	p.Name = "EnemyProjectile"
+	p.Shape = Enum.PartType.Cylinder
+	p.Size = Vector3.new(2.4, 0.38, 0.38)
+	p.Color = color or Color3.fromRGB(240, 240, 230)
+	p.Material = Enum.Material.SmoothPlastic
+	p.Anchored = true
+	p.CanCollide = false
+	p.CFrame = CFrame.lookAt(fromPos, fromPos + dir) * CFrame.Angles(0, 0, math.rad(90))
+	p.Parent = Workspace
+	table.insert(AI.projectiles, {
+		part = p,
+		vel = dir * speed,
+		damage = damage,
+		source = sourceModel,
+		born = os.clock(),
+		from = fromPos,
+	})
+end
+
+AI.projectileLoop = function()
+	while true do
+		task.wait(0.05)
+		for i = #AI.projectiles, 1, -1 do
+			local pr = AI.projectiles[i]
+			local part = pr.part
+			local dead = false
+			if not part or not part.Parent then
+				dead = true
+			else
+				part.Position = part.Position + pr.vel * 0.05
+				local pos = part.Position
+				if os.clock() - pr.born > 3 or pos.Y < 0.2
+					or horizontalDistance(pos, pr.from) > 75 then
+					dead = true
+				else
+					for _, player in ipairs(Players:GetPlayers()) do
+						local phrp = getHRP(player.Character)
+						local phum = getHumanoid(player.Character)
+						if phrp and phum and phum.Health > 0 then
+							local d = (phrp.Position + Vector3.new(0, 1.5, 0) - pos).Magnitude
+							if d < 3.2 then
+								AI.damagePlayer(player, pr.damage, pr.source)
+								dead = true
+								break
+							end
+						end
+					end
+				end
+				if dead then part:Destroy() end
+			end
+			if dead then table.remove(AI.projectiles, i) end
+		end
+	end
+end
+
+--====================================================================
+-- BEHAVIOR HELPERS
+--====================================================================
+-- Nearest living player to `fromPos`. Field wildlife passes its
+-- home + a leash radius so it only engages players near its home.
+AI.nearestPlayer = function(fromPos, maxDist, anchorPos, anchorRadius)
+	local bestPlayer, bestDist = nil, maxDist
+	for _, player in ipairs(Players:GetPlayers()) do
+		local phrp = getHRP(player.Character)
+		local phum = getHumanoid(player.Character)
+		if phrp and phum and phum.Health > 0 then
+			if anchorPos and horizontalDistance(phrp.Position, anchorPos) > anchorRadius then
+				-- player outside the leash anchor: not a target
+			else
+				local d = horizontalDistance(fromPos, phrp.Position)
+				if d < bestDist then
+					bestDist = d
+					bestPlayer = player
+				end
+			end
+		end
+	end
+	return bestPlayer, bestDist
+end
+
+AI.flatDir = function(fromPos, toPos)
+	local d = Vector3.new(toPos.X - fromPos.X, 0, toPos.Z - fromPos.Z)
+	if d.Magnitude < 0.05 then return Vector3.new(0, 0, -1) end
+	return d.Unit
+end
+
+--====================================================================
+-- SLIME: hopper. Hops toward the player (hop velocity + the squash
+-- system), contact damage only right after landing near the player
+-- (0.8s gate), and a telegraphed LEAP every ~3.5s in range.
+--====================================================================
+AI.behaveSlime = function(model, data, root, humanoid, target, dist, now)
+	local ai = data.ai
+	local myPos = root.Position
+	if target then
+		local phrp = getHRP(target.Character)
+		-- LEAP ATTACK: crouch telegraph, then arc onto the player
+		if dist <= 17 and dist > 4 and now >= ai.leapNext and not ai.busy then
+			ai.busy = true
+			ai.leapNext = now + 3.5
+			humanoid:MoveTo(myPos)
+			-- crouch: squash the body flat for 0.4s
+			if data.bodyPart and data.baseBodySize then
+				local bp, bs = data.bodyPart, data.baseBodySize
+				bp.Size = Vector3.new(bs.X * 1.25, bs.Y * 0.5, bs.Z * 1.25)
+			end
+			local targetPos = phrp.Position
+			task.delay(0.4, function()
+				if not model.Parent or not enemies[model] then return end
+				local startPos = root.Position
+				local dest = Vector3.new(targetPos.X, startPos.Y, targetPos.Z)
+				local t0 = os.clock()
+				local dur = 0.55
+				task.spawn(function()
+					while model.Parent and enemies[model] and os.clock() - t0 < dur do
+						local t = (os.clock() - t0) / dur
+						local pos = startPos:Lerp(dest, t)
+						pos = pos + Vector3.new(0, math.sin(t * math.pi) * 6, 0)
+						root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
+						task.wait(0.03)
+					end
+					ai.busy = false
+					if not model.Parent or not enemies[model] then return end
+					-- landing: damage anyone within 4 studs, once
+					for _, player in ipairs(Players:GetPlayers()) do
+						local p2 = getHRP(player.Character)
+						local h2 = getHumanoid(player.Character)
+						if p2 and h2 and h2.Health > 0
+							and horizontalDistance(p2.Position, dest) <= 4 then
+							AI.damagePlayer(player, data.damage, model)
+						end
+					end
+					ai.touchCd = now + 0.8
+				end)
+			end)
+			return
+		end
+		if ai.busy then return end
+		if dist > 4 then
+			humanoid:MoveTo(phrp.Position)
+			-- little hop while travelling (lands -> squash reads as a hop)
+			if not ai.hopAt or now - ai.hopAt > 0.85 then
+				ai.hopAt = now
+				pcall(function()
+					root.AssemblyLinearVelocity = Vector3.new(
+						root.AssemblyLinearVelocity.X, 11, root.AssemblyLinearVelocity.Z)
+				end)
+			end
+		else
+			humanoid:MoveTo(myPos)
+			-- contact damage, gated to once per 0.8s (no touch drain)
+			if now >= ai.touchCd then
+				ai.touchCd = now + 0.8
+				AI.damagePlayer(target, data.damage, model)
+			end
+		end
+	else
+		if ai.busy then return end
+		-- field slimes drift back home when nobody is near
+		if data.isField and data.home
+			and horizontalDistance(myPos, data.home) > 3 then
+			humanoid:MoveTo(data.home)
+		else
+			humanoid:MoveTo(myPos)
+		end
+	end
+end
+
+--====================================================================
+-- GOBLIN: dasher. Fast approach with occasional sideways strafes;
+-- at 10-18 studs it winds up (flash + lean) and DASHES at the
+-- player, then recovers slowly for 1s.
+--====================================================================
+AI.behaveGoblin = function(model, data, root, humanoid, target, dist, now)
+	local ai = data.ai
+	local myPos = root.Position
+	if ai.busy then return end
+	if not target then
+		humanoid:MoveTo(myPos)
+		return
+	end
+	local phrp = getHRP(target.Character)
+	-- recovering from a dash: crawl at 40% speed
+	if now < ai.recoverUntil then
+		humanoid.WalkSpeed = data.speed * 0.4 * (ai.slowFactor or 1)
+		humanoid:MoveTo(phrp.Position)
+		return
+	end
+	-- DASH: wind-up then burst
+	if dist >= 10 and dist <= 18 and now >= ai.dashNext then
+		ai.busy = true
+		ai.dashNext = now + 2.8 + math.random() * 1.2
+		humanoid:MoveTo(myPos)
+		flashEnemy(model, data) -- white flash telegraph
+		local targetPos = phrp.Position
+		task.delay(0.35, function()
+			if not model.Parent or not enemies[model] then return end
+			local startPos = root.Position
+			local dest = Vector3.new(targetPos.X, startPos.Y, targetPos.Z)
+			local dashDist = (dest - startPos).Magnitude
+			local dur = math.max(0.18, dashDist / 65)
+			local t0 = os.clock()
+			task.spawn(function()
+				while model.Parent and enemies[model] and os.clock() - t0 < dur do
+					local t = (os.clock() - t0) / dur
+					local pos = startPos:Lerp(dest, t)
+					root.CFrame = CFrame.new(pos) * (root.CFrame - root.CFrame.Position)
+					task.wait(0.03)
+				end
+				ai.busy = false
+				ai.recoverUntil = os.clock() + 1
+				if not model.Parent or not enemies[model] then return end
+				local p2 = getHRP(target.Character)
+				local h2 = getHumanoid(target.Character)
+				if p2 and h2 and h2.Health > 0
+					and horizontalDistance(p2.Position, dest) <= 4.5 then
+					AI.damagePlayer(target, data.damage, model)
+					ai.touchCd = os.clock() + 1
+				end
+			end)
+		end)
+		return
+	end
+	if dist > 4 then
+		-- strafe sideways sometimes instead of running straight in
+		if now >= ai.strafeNext then
+			ai.strafeNext = now + 1.6
+			if math.random() < 0.3 then
+				ai.strafeUntil = now + 0.6
+				ai.strafeDir = (math.random() < 0.5) and 1 or -1
+			end
+		end
+		if now < ai.strafeUntil then
+			local dir = AI.flatDir(myPos, phrp.Position)
+			local side = Vector3.new(-dir.Z, 0, dir.X) * ai.strafeDir
+			humanoid:MoveTo(phrp.Position + side * 9)
+		else
+			humanoid:MoveTo(phrp.Position)
+		end
+	else
+		humanoid:MoveTo(myPos)
+		if now >= ai.touchCd then
+			ai.touchCd = now + 1
+			AI.damagePlayer(target, data.damage, model)
+		end
+	end
+end
+
+--====================================================================
+-- SKELETON: ranged kiter. Holds 22-30 studs, strafes slowly,
+-- shoots a bone every 2.2s; weak melee + retreat up close.
+--====================================================================
+AI.behaveSkeleton = function(model, data, root, humanoid, target, dist, now)
+	local ai = data.ai
+	local myPos = root.Position
+	if not target then
+		humanoid:MoveTo(myPos)
+		return
+	end
+	local phrp = getHRP(target.Character)
+	local dir = AI.flatDir(myPos, phrp.Position)
+	if dist < 6 then
+		-- too close: weak swipe, then back off
+		if now >= ai.touchCd then
+			ai.touchCd = now + 1.1
+			AI.damagePlayer(target, math.floor(data.damage * 0.6), model)
+		end
+		humanoid:MoveTo(myPos - dir * 12)
+	elseif dist < 22 then
+		humanoid:MoveTo(myPos - dir * 8) -- back away to range
+	elseif dist > 30 then
+		humanoid:MoveTo(phrp.Position) -- close in to range
+	else
+		-- in the pocket: slow sideways orbit
+		local side = Vector3.new(-dir.Z, 0, dir.X)
+		local orbit = ((math.floor(now * 0.5 + data.phase) % 2) == 0) and 1 or -1
+		humanoid:MoveTo(phrp.Position - dir * 26 + side * orbit * 7)
+	end
+	-- bone shot
+	if dist <= 44 and now >= ai.shootNext then
+		ai.shootNext = now + 2.2
+		local from = myPos + Vector3.new(0, 3.2, 0)
+		local to = phrp.Position + Vector3.new(0, 2.2, 0)
+		AI.spawnEnemyProjectile(from, to, 55, math.floor(data.damage * 0.8), model)
+	end
+end
+
+--====================================================================
+-- BOSS (Skeleton King): chases + heavy melee, plus SLAM (r10),
+-- SUMMONS at 66% / 33% HP (adds capped at 4, half rewards), bone
+-- VOLLEY fan, and ENRAGE below 30% HP.
+--====================================================================
+AI.bossSummon = function(model, data, root)
+	local adds = 0
+	for _, d in pairs(enemies) do
+		if d.summoned and not d.isDummy then adds = adds + 1 end
+	end
+	local want = math.random(2, 3)
+	local spawned = 0
+	for i = 1, want do
+		if adds + spawned >= 4 then break end
+		local kind = (i % 2 == 0) and "Slime" or "Skeleton"
+		local side = (i % 2 == 0) and 6 or -6
+		local m = spawnEnemy(kind, root.Position + Vector3.new(side, 0, 3), 1)
+		if m then
+			local d = enemies[m]
+			if d then
+				d.summoned = true
+				d.xp = math.floor(d.xp * 0.5)
+				d.gold = math.floor(d.gold * 0.5)
+			end
+			spawned = spawned + 1
+			spawnSparks(root.Position + Vector3.new(side, 2, 3))
+		end
+	end
+	if spawned > 0 then
+		announce("The Skeleton King summons minions!", 3)
+	end
+end
+
+AI.behaveBoss = function(model, data, root, humanoid, target, dist, now)
+	local ai = data.ai
+	local myPos = root.Position
+	local frac = humanoid.Health / humanoid.MaxHealth
+	-- summons at HP thresholds
+	if not ai.summoned66 and frac <= 0.66 then
+		ai.summoned66 = true
+		AI.bossSummon(model, data, root)
+	end
+	if not ai.summoned33 and frac <= 0.33 then
+		ai.summoned33 = true
+		AI.bossSummon(model, data, root)
+	end
+	-- enrage below 30%
+	if not ai.enraged and frac <= 0.30 then
+		ai.enraged = true
+		data.speed = data.speed * 1.4
+		for _, p in ipairs(model:GetChildren()) do
+			if p.Name == "EyeSocket" then
+				p.Color = Color3.fromRGB(255, 40, 40)
+				p.Material = Enum.Material.Neon
+			end
+		end
+		local gui = root:FindFirstChild("HealthBar")
+		if gui then
+			local nl = gui:FindFirstChild("NameLabel")
+			if nl then nl.Text = nl.Text .. " (Enraged)" end
+		end
+		announce("The Skeleton King is ENRAGED!", 3)
+	end
+	local cdMul = ai.enraged and 0.65 or 1
+	if not target then
+		humanoid:MoveTo(myPos)
+		return
+	end
+	local phrp = getHRP(target.Character)
+	-- SLAM on the target's position
+	if dist <= 26 and now >= ai.slamNext then
+		ai.slamNext = now + 7 * cdMul
+		AI.spawnTelegraph(phrp.Position, 10, 1.0, math.floor(data.damage * 1.6), model)
+	end
+	-- bone VOLLEY: fan of 3
+	if dist <= 46 and now >= ai.volleyNext then
+		ai.volleyNext = now + 5 * cdMul
+		local from = myPos + Vector3.new(0, 4.5, 0)
+		local baseDir = AI.flatDir(myPos, phrp.Position)
+		for _, yaw in ipairs({ -14, 0, 14 }) do
+			local d = CFrame.Angles(0, math.rad(yaw), 0):VectorToWorldSpace(baseDir)
+			AI.spawnEnemyProjectile(from, from + d * 30, 55,
+				math.floor(data.damage * 0.7), model,
+				Color3.fromRGB(255, 230, 180))
+		end
+	end
+	-- chase + heavy melee
+	if dist > 6 then
+		humanoid:MoveTo(phrp.Position)
+	else
+		humanoid:MoveTo(myPos)
+		if now >= ai.touchCd then
+			ai.touchCd = now + 1.2
+			AI.damagePlayer(target, data.damage, model)
+		end
+	end
+end
+
+--====================================================================
+-- ELITE SLAM: any non-boss elite periodically telegraph-slams the
+-- nearest player's position (r7, 0.7s warning, ~6s cooldown).
+--====================================================================
+AI.eliteSlamCheck = function(model, data, target, dist, now)
+	local ai = data.ai
+	if not target or dist > 20 or now < ai.slamNext then return end
+	ai.slamNext = now + 6
+	local phrp = getHRP(target.Character)
+	if phrp then
+		AI.spawnTelegraph(phrp.Position, 7, 0.7, math.floor(data.damage * 1.4), model)
+	end
+end
+
+--====================================================================
+-- MAIN AI LOOP (0.25s decisions; projectiles run in their own
+-- 0.05s loop, started at the bottom of the file)
 --====================================================================
 local function aiLoop()
 	while true do
 		task.wait(0.25)
+		local now = os.clock()
 		for model, data in pairs(enemies) do
 			local root = model:FindFirstChild("HumanoidRootPart")
 			local humanoid = model:FindFirstChildOfClass("Humanoid")
 			if root and humanoid and humanoid.Health > 0 then
-				-- slime squash-and-stretch bounce
-				if data.kind == "Slime" and data.bodyPart and data.baseBodySize then
-					local bp = data.bodyPart
-					if bp.Parent then
-						local w = math.sin(os.clock() * 6 + data.phase)
-						local bs = data.baseBodySize
-						bp.Size = Vector3.new(
-							bs.X * (1 - 0.07 * w), bs.Y * (1 + 0.16 * w), bs.Z * (1 - 0.07 * w))
-					end
-				end
-				-- Frost Nova slow (v5): honored here every AI tick
-				local slowFactor = 1
-				if data.slowUntil and os.clock() < data.slowUntil then
-					slowFactor = data.slowFactor or 1
-				end
-				humanoid.WalkSpeed = data.speed * slowFactor
-				-- find nearest living player
-				local bestPlayer, bestDist = nil, 90
-				for _, player in ipairs(Players:GetPlayers()) do
-					local phrp = getHRP(player.Character)
-					local phum = getHumanoid(player.Character)
-					if phrp and phum and phum.Health > 0 then
-						local d = horizontalDistance(root.Position, phrp.Position)
-						if d < bestDist then
-							bestDist = d
-							bestPlayer = player
+				if data.isDummy then
+					-- dummies never act; HP is reset in damageEnemy
+				else
+					-- slime squash-and-stretch (suppressed mid-leap-
+					-- crouch is fine: the leap task restores via Size)
+					if data.kind == "Slime" and data.bodyPart and data.baseBodySize
+						and not data.ai.busy then
+						local bp = data.bodyPart
+						if bp.Parent then
+							local w = math.sin(now * 6 + data.phase)
+							local bs = data.baseBodySize
+							bp.Size = Vector3.new(
+								bs.X * (1 - 0.07 * w), bs.Y * (1 + 0.16 * w), bs.Z * (1 - 0.07 * w))
 						end
 					end
-				end
-				if bestPlayer then
-					local phrp = getHRP(bestPlayer.Character)
-					local phum = getHumanoid(bestPlayer.Character)
-					local reach = data.isBoss and 6 or 4
-					if bestDist > reach then
-						humanoid:MoveTo(phrp.Position)
+					-- Frost Nova slow (v5)
+					local slowFactor = 1
+					if data.slowUntil and now < data.slowUntil then
+						slowFactor = data.slowFactor or 1
+					end
+					data.ai.slowFactor = slowFactor
+					humanoid.WalkSpeed = data.speed * slowFactor
+					-- target selection (field wildlife is leashed)
+					local target, dist
+					if data.isField and data.home then
+						target, dist = AI.nearestPlayer(root.Position, 60, data.home, 26)
+						if target and horizontalDistance(root.Position, data.home) > 20 then
+							-- dragged too far from home: disengage
+							target = nil
+						end
+					else
+						target, dist = AI.nearestPlayer(root.Position, 90)
+					end
+					if data.isBoss then
+						AI.behaveBoss(model, data, root, humanoid, target, dist or 999, now)
+					elseif data.kind == "Slime" then
+						AI.behaveSlime(model, data, root, humanoid, target, dist or 999, now)
+					elseif data.kind == "Goblin" then
+						AI.behaveGoblin(model, data, root, humanoid, target, dist or 999, now)
+					elseif data.kind == "Skeleton" then
+						AI.behaveSkeleton(model, data, root, humanoid, target, dist or 999, now)
 					else
 						humanoid:MoveTo(root.Position)
-						local now = os.clock()
-						if now - data.lastAttack >= 1.1 then
-							data.lastAttack = now
-							-- Damage reduction: Armor points (8% each) plus
-							-- equipped chest % -- combined, capped at 75%.
-							local armor = getStat(bestPlayer, "Stats", "Armor")
-							local armorPoints = armor and math.clamp(armor.Value, 0, MAX_ARMOR) or 0
-							local gearDEF = getStat(bestPlayer, "Stats", "GearDEF")
-							local reduction = ARMOR_PER_POINT * armorPoints
-								+ (gearDEF and gearDEF.Value or 0) / 100
-							reduction = math.min(reduction, 0.75)
-							-- Class modifiers (v5): Paladin's inherent
-							-- reduction and an active War Cry multiply in.
-							local incoming = data.damage * (1 - reduction)
-								* classIncomingMul(bestPlayer)
-							phum:TakeDamage(incoming)
-							playSfx("Hurt", phrp, true)
-							-- Thorns Aura (v5): reflect a fraction of the
-							-- enemy's own damage stat back at it.
-							local reflect = thornsReflectFor(bestPlayer)
-							if reflect > 0 then
-								damageEnemy(model, data.damage * reflect, bestPlayer, nil)
-							end
-						end
 					end
-				else
-					humanoid:MoveTo(root.Position)
+					if data.isElite and not data.isBoss then
+						AI.eliteSlamCheck(model, data, target, dist or 999, now)
+					end
 				end
 			end
 		end
@@ -3896,6 +4833,25 @@ local function setupShop()
 end
 setupShop()
 
+-- v6: Class Mentor prompt. ProximityPrompts fire server-side, so
+-- this needs NO UIClient change: it re-opens the class panel with
+-- exactly the same state changes as the Class button.
+local function setupMentor()
+	if not mentorStandPart then return end
+	local prompt = Instance.new("ProximityPrompt")
+	prompt.ActionText = "Change Class"
+	prompt.ObjectText = "Class Mentor"
+	prompt.HoldDuration = 0
+	prompt.MaxActivationDistance = 12
+	prompt.Parent = mentorStandPart
+	prompt.Triggered:Connect(function(player)
+		classPanelOpen[player] = true
+		skillsOpen[player] = false
+		refreshClassUI(player)
+	end)
+end
+setupMentor()
+
 --====================================================================
 -- PORTALS
 --====================================================================
@@ -3918,7 +4874,9 @@ local function setupPortal(part, destination)
 	end)
 end
 setupPortal(portalToDungeon, DUNGEON_ENTRANCE + Vector3.new(0, 0, -12))
-setupPortal(portalToTown, TOWN_CENTER + Vector3.new(0, 3, -30))
+-- v6: the dungeon return portal lands back at the field-side gate
+-- arch (travel loop: town -> field -> dungeon -> field)
+setupPortal(portalToTown, Vector3.new(0, 3, -47))
 
 --====================================================================
 -- PLAYER LIFECYCLE
@@ -4263,7 +5221,20 @@ task.spawn(function()
 		end
 	end
 end)
+-- v6: training dummies on the town plaza (west side) + the four
+-- leashed field slimes (they respawn at home via onEnemyDeath)
+spawnTrainingDummy(Vector3.new(-24, 0, TOWN_CENTER.Z + 16))
+spawnTrainingDummy(Vector3.new(-31, 0, TOWN_CENTER.Z + 9))
+spawnTrainingDummy(Vector3.new(-18, 0, TOWN_CENTER.Z + 25))
+for _, homePos in ipairs({
+	Vector3.new(-14, 0, -6), Vector3.new(18, 0, -28),
+	Vector3.new(-24, 0, -38), Vector3.new(8, 0, -48),
+}) do
+	spawnFieldSlime(homePos)
+end
+
 task.spawn(aiLoop)
+task.spawn(AI.projectileLoop) -- v6: enemy bone projectiles, 0.05s steps
 task.spawn(waveLoop)
 
 -- ZONE LOOP (0.5s): campfires heal players standing within 7 studs
@@ -4327,4 +5298,4 @@ task.spawn(function()
 	end
 end)
 
-print("[ShiningSoul] v5 server started: four classes (Warrior / Mage / Archer / Paladin) with upgradable skills ready.")
+print("[ShiningSoul] v6 server started: monster skills & AI patterns, non-combat town hub and field zone ready.")
