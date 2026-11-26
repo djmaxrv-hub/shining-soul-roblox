@@ -1,8 +1,14 @@
 --====================================================================
--- Shining Soul-type 3D ARPG for Roblox -- v4 (single-file server)
+-- Shining Soul-type 3D ARPG for Roblox -- v5 (single-file server)
 -- Paste this whole file into ONE Script in ServerScriptService.
 -- Everything (map, enemies, tools, HUD, shop, waves) is built and
 -- wired up at runtime by this script. No child scripts are used.
+-- v5: CLASS system -- four Diablo-2-inspired classes (Warrior /
+--     Mage / Archer / Paladin), each with its own tool loadout and
+--     3 upgradable skills (levels 0-5). 1 skill point per level-up;
+--     skill levels are stored PER CLASS, so switching class keeps
+--     level + gear and restores that class's build. Cast from the
+--     skill bar or the Q / E / R hotkeys (UIClient forwards keys).
 -- v4: full EQUIPMENT system -- rarity gear drops (Common / Rare /
 --     Epic / Legendary) from normal / elite / boss enemies, a bag +
 --     equip UI (needs the one-time UIClient LocalScript, see the
@@ -71,6 +77,29 @@ end
 
 local function swordUpgradePrice(tier)
 	return 150 * tier
+end
+
+--====================================================================
+-- CLASSES (v5): base modifiers per class. Applied inside the
+-- existing formulas: HP cap (maxHealthFor), sword / fireball / bow
+-- damage, mana cap (maxManaFor), walk speed (applyGear), and the
+-- enemy -> player damage path (Paladin's inherent reduction).
+--====================================================================
+local CLASS_IDS = { "Warrior", "Mage", "Archer", "Paladin" }
+local CLASS_DEFS = {
+	Warrior = { name = "Warrior", cn = "战士",
+		hp = 1.4, melee = 1.25, spell = 1.0, ranged = 1.0, mana = 0.7, speed = 16, defRed = 0 },
+	Mage = { name = "Mage", cn = "法师",
+		hp = 0.75, melee = 1.0, spell = 1.4, ranged = 1.0, mana = 1.8, speed = 16, defRed = 0 },
+	Archer = { name = "Archer", cn = "弓手",
+		hp = 0.95, melee = 1.0, spell = 1.0, ranged = 1.3, mana = 1.0, speed = 17.5, defRed = 0 },
+	Paladin = { name = "Paladin", cn = "圣骑士",
+		hp = 1.2, melee = 1.05, spell = 1.0, ranged = 1.0, mana = 1.1, speed = 16, defRed = 0.05 },
+}
+local DEFAULT_MODS = { hp = 1, melee = 1, spell = 1, ranged = 1, mana = 1, speed = 16, defRed = 0 }
+
+local function modsForClass(classId)
+	return CLASS_DEFS[classId] or DEFAULT_MODS
 end
 
 --====================================================================
@@ -175,6 +204,11 @@ end
 -- down, but referenced by earlier code (enemy death, level-ups).
 local spawnGearDrop -- (position, rarityWeights) -> spawns a gear drop
 local maxHealthFor -- (player) -> max HP incl. level + helmet bonus
+-- Class system (v5), defined in the class section further down:
+local classDamageMul -- (player, "melee"|"spell"|"ranged") -> outgoing damage multiplier
+local classIncomingMul -- (player) -> incoming damage multiplier (Paladin + War Cry)
+local thornsReflectFor -- (player) -> fraction of enemy damage reflected (0 = off)
+local maxManaFor -- (player) -> mana cap incl. class multiplier
 
 --====================================================================
 -- WORLD BUILDING
@@ -802,9 +836,11 @@ local function addXP(player, amount)
 	local xp = stats:FindFirstChild("XP")
 	if not level or not xp then return end
 	xp.Value = xp.Value + amount
+	local gainedLevels = 0
 	while xp.Value >= xpThreshold(level.Value) do
 		xp.Value = xp.Value - xpThreshold(level.Value)
 		level.Value = level.Value + 1
+		gainedLevels = gainedLevels + 1
 		local character = player.Character
 		local humanoid = getHumanoid(character)
 		if humanoid then
@@ -813,6 +849,11 @@ local function addXP(player, amount)
 		end
 		playSfx("LevelUp", getHRP(character))
 		announce(player.Name .. " reached Level " .. level.Value .. "!", 3)
+	end
+	-- v5: every level-up grants 1 skill point
+	if gainedLevels > 0 then
+		local sp = getStat(player, "Stats", "SkillPoints")
+		if sp then sp.Value = sp.Value + gainedLevels end
 	end
 end
 
@@ -892,12 +933,19 @@ local function updateHUD(player)
 	local gold = getStat(player, "leaderstats", "Gold")
 	local mana = getStat(player, "Stats", "Mana")
 	local potions = getStat(player, "Stats", "Potions")
-	if level then panel.LevelLabel.Text = "Level " .. level.Value end
+	if level then
+		local classVal = getStat(player, "Stats", "Class")
+		local classSuffix = ""
+		if classVal and classVal.Value ~= "" then
+			classSuffix = " - " .. classVal.Value
+		end
+		panel.LevelLabel.Text = "Level " .. level.Value .. classSuffix
+	end
 	if xp and level then
 		panel.XPLabel.Text = "XP " .. xp.Value .. " / " .. xpThreshold(level.Value)
 	end
 	if gold then panel.GoldLabel.Text = "Gold " .. gold.Value end
-	if mana then panel.ManaLabel.Text = "Mana " .. mana.Value .. " / " .. MAX_MANA end
+	if mana then panel.ManaLabel.Text = "Mana " .. mana.Value .. " / " .. maxManaFor(player) end
 	if potions then panel.PotionLabel.Text = "Potions " .. potions.Value end
 	local armor = getStat(player, "Stats", "Armor")
 	local power = getStat(player, "Stats", "Power")
@@ -1523,6 +1571,12 @@ local function aiLoop()
 							bs.X * (1 - 0.07 * w), bs.Y * (1 + 0.16 * w), bs.Z * (1 - 0.07 * w))
 					end
 				end
+				-- Frost Nova slow (v5): honored here every AI tick
+				local slowFactor = 1
+				if data.slowUntil and os.clock() < data.slowUntil then
+					slowFactor = data.slowFactor or 1
+				end
+				humanoid.WalkSpeed = data.speed * slowFactor
 				-- find nearest living player
 				local bestPlayer, bestDist = nil, 90
 				for _, player in ipairs(Players:GetPlayers()) do
@@ -1555,8 +1609,18 @@ local function aiLoop()
 							local reduction = ARMOR_PER_POINT * armorPoints
 								+ (gearDEF and gearDEF.Value or 0) / 100
 							reduction = math.min(reduction, 0.75)
-							phum:TakeDamage(data.damage * (1 - reduction))
+							-- Class modifiers (v5): Paladin's inherent
+							-- reduction and an active War Cry multiply in.
+							local incoming = data.damage * (1 - reduction)
+								* classIncomingMul(bestPlayer)
+							phum:TakeDamage(incoming)
 							playSfx("Hurt", phrp, true)
+							-- Thorns Aura (v5): reflect a fraction of the
+							-- enemy's own damage stat back at it.
+							local reflect = thornsReflectFor(bestPlayer)
+							if reflect > 0 then
+								damageEnemy(model, data.damage * reflect, bestPlayer, nil)
+							end
 						end
 					end
 				else
@@ -1694,6 +1758,7 @@ local function createSword(player)
 			+ ((tier and tier.Value or 1) - 1) * 8
 			+ (power and power.Value or 0)
 			+ (gearATK and gearATK.Value or 0)
+		dmg = dmg * classDamageMul(player, "melee") -- v5 class + War Cry
 		playSfx("Swing", hrp, true)
 		-- AUTO-LOCK: turn to face the nearest enemy and step into range,
 		-- so a click always connects. No manual aiming, no facing check.
@@ -1795,6 +1860,7 @@ local function createFireballTool(player)
 		local dmg = FIREBALL_BASE_DAMAGE + ((level and level.Value or 1) - 1) * 3
 			+ (firePower and firePower.Value or 0)
 			+ (fireGearATK and fireGearATK.Value or 0)
+		dmg = dmg * classDamageMul(player, "spell") -- v5 class modifier
 		-- AUTO-AIM: lock onto the nearest enemy in range. The fireball
 		-- homes in on it, so the player never aims manually.
 		local target, targetDist = nil, 80
@@ -2003,6 +2069,9 @@ maxHealthFor = function(player)
 	if state and state.equipped.Helmet then
 		hp = hp + state.equipped.Helmet.stat
 	end
+	-- v5: class HP multiplier applies to the whole pool
+	local classVal = getStat(player, "Stats", "Class")
+	hp = math.floor(hp * modsForClass(classVal and classVal.Value or "").hp)
 	return hp
 end
 
@@ -2195,7 +2264,10 @@ local function applyGear(player)
 				humanoid.Health = math.clamp(ratio * newMax, 1, newMax)
 			end
 		end
-		humanoid.WalkSpeed = 16 + (eq.Boots and eq.Boots.stat or 0)
+		-- v5: class base speed (Archer 17.5) + equipped boots bonus
+		local classVal = getStat(player, "Stats", "Class")
+		local baseSpeed = modsForClass(classVal and classVal.Value or "").speed
+		humanoid.WalkSpeed = baseSpeed + (eq.Boots and eq.Boots.stat or 0)
 	end
 	rebuildWornGear(player)
 	restylePlayerSword(player)
@@ -2332,6 +2404,22 @@ local function buildBagUI(player)
 	button.BorderSizePixel = 0
 	button:SetAttribute("Act", "ToggleBag")
 	button.Parent = gui
+
+	-- v5: Skills toggle sits next to the Bag button (its panel lives
+	-- in the ShiningClass gui; clicks arrive via the same UIEvent)
+	local skillsButton = Instance.new("TextButton")
+	skillsButton.Name = "SkillsButton"
+	skillsButton.Size = UDim2.new(0, 110, 0, 36)
+	skillsButton.Position = UDim2.new(0, 130, 0, 206)
+	skillsButton.Text = "Skills"
+	skillsButton.Font = Enum.Font.GothamBold
+	skillsButton.TextSize = 16
+	skillsButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	skillsButton.BackgroundColor3 = Color3.fromRGB(48, 38, 64)
+	skillsButton.BackgroundTransparency = 0.15
+	skillsButton.BorderSizePixel = 0
+	skillsButton:SetAttribute("Act", "ToggleSkills")
+	skillsButton.Parent = gui
 
 	local panel = Instance.new("Frame")
 	panel.Name = "BagPanel"
@@ -2547,6 +2635,1217 @@ uiEvent.OnServerEvent:Connect(function(player, act, arg)
 end)
 
 --====================================================================
+-- CLASS + SKILL SYSTEM (v5)
+-- Four Diablo-2-inspired classes. The class id lives in the Stats
+-- StringValue "Class" ("" = not chosen). Skill levels are stored
+-- PER CLASS in skillState (skills[classId] = {lv, lv, lv}), so
+-- switching class keeps level + gear and restores that class's
+-- build. 1 skill point per level-up (Stats "SkillPoints").
+-- Casts arrive via UIEvent acts ChooseClass / ToggleClass /
+-- ToggleSkills / SkillUp / CastSkill (buttons + Q/E/R hotkeys
+-- forwarded by UIClient).
+--====================================================================
+local skillState = {} -- [player] = { skills={[classId]={0,0,0}}, cooldowns={}, thornsOn=false }
+local buffs = {}      -- [player] = { dmgMul=, defRed=, expires= } (War Cry)
+local classRefs = {}  -- [player] = { gui, panel, skillsPanel, classButtons }
+local skillBarRefs = {} -- [player] = { buttons = {b1, b2, b3} }
+local classPanelOpen = {} -- [player] = bool
+local skillsOpen = {}     -- [player] = bool
+local HOTKEYS = { "Q", "E", "R" }
+
+local function getClassId(player)
+	local classVal = getStat(player, "Stats", "Class")
+	local cid = classVal and classVal.Value or ""
+	if CLASS_DEFS[cid] then return cid end
+	return ""
+end
+
+local function getSkillLevel(player, classId, idx)
+	local st = skillState[player]
+	if not st then return 0 end
+	local arr = st.skills[classId]
+	return arr and arr[idx] or 0
+end
+
+local function newSkillState()
+	local skills = {}
+	for _, cid in ipairs(CLASS_IDS) do
+		skills[cid] = { 0, 0, 0 }
+	end
+	return { skills = skills, cooldowns = {}, thornsOn = false }
+end
+
+-- Outgoing damage multiplier: class modifier x active War Cry buff.
+classDamageMul = function(player, kind)
+	local mods = modsForClass(getClassId(player))
+	local mul = mods[kind] or 1
+	local b = buffs[player]
+	if b and os.clock() < b.expires then
+		mul = mul * b.dmgMul
+	end
+	return mul
+end
+
+-- Incoming damage multiplier: Paladin's inherent 5% reduction and
+-- an active War Cry multiply into the armor/gear reduction.
+classIncomingMul = function(player)
+	local mods = modsForClass(getClassId(player))
+	local mul = 1 - mods.defRed
+	local b = buffs[player]
+	if b and os.clock() < b.expires then
+		mul = mul * (1 - b.defRed)
+	end
+	return mul
+end
+
+-- Thorns Aura: Lv1 reflects 10% of the attacker's damage stat,
+-- +4% per extra level (Lv5 = 26%). 0 when off / not a Paladin.
+thornsReflectFor = function(player)
+	local st = skillState[player]
+	if not st or not st.thornsOn then return 0 end
+	if getClassId(player) ~= "Paladin" then return 0 end
+	local lv = getSkillLevel(player, "Paladin", 3)
+	if lv < 1 then return 0 end
+	return 0.06 + 0.04 * lv
+end
+
+maxManaFor = function(player)
+	return math.floor(MAX_MANA * modsForClass(getClassId(player)).mana)
+end
+
+-- Raw damage bases (BEFORE the class multiplier), mirroring the
+-- sword / fireball tool formulas so skills scale with progression.
+local function playerWeaponDamage(player)
+	local level = getStat(player, "leaderstats", "Level")
+	local tier = getStat(player, "Stats", "SwordTier")
+	local power = getStat(player, "Stats", "Power")
+	local gearATK = getStat(player, "Stats", "GearATK")
+	return SWORD_BASE_DAMAGE
+		+ ((level and level.Value or 1) - 1) * 2
+		+ ((tier and tier.Value or 1) - 1) * 8
+		+ (power and power.Value or 0)
+		+ (gearATK and gearATK.Value or 0)
+end
+
+local function playerSpellDamage(player)
+	local level = getStat(player, "leaderstats", "Level")
+	local power = getStat(player, "Stats", "Power")
+	local gearATK = getStat(player, "Stats", "GearATK")
+	return FIREBALL_BASE_DAMAGE
+		+ ((level and level.Value or 1) - 1) * 3
+		+ (power and power.Value or 0)
+		+ (gearATK and gearATK.Value or 0)
+end
+
+local function playerRangedDamage(player)
+	local level = getStat(player, "leaderstats", "Level")
+	local power = getStat(player, "Stats", "Power")
+	local gearATK = getStat(player, "Stats", "GearATK")
+	return 11
+		+ ((level and level.Value or 1) - 1) * 2
+		+ (power and power.Value or 0)
+		+ (gearATK and gearATK.Value or 0)
+end
+
+--====================================================================
+-- SKILL FX HELPERS
+--====================================================================
+-- Expanding flat neon ring on the ground (nova / heal / war cry...)
+local function ringFX(position, radius, color, duration)
+	duration = duration or 0.35
+	local ring = Instance.new("Part")
+	ring.Name = "SkillRing"
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.35, 2, 2)
+	ring.CFrame = CFrame.new(position.X, 0.4, position.Z)
+		* CFrame.Angles(0, 0, math.rad(90))
+	ring.Color = color
+	ring.Material = Enum.Material.Neon
+	ring.Transparency = 0.3
+	ring.Anchored = true
+	ring.CanCollide = false
+	ring.Parent = Workspace
+	task.spawn(function()
+		local t0 = os.clock()
+		while ring.Parent do
+			local t = (os.clock() - t0) / duration
+			if t >= 1 then break end
+			local d = 2 + (radius * 2 - 2) * t
+			ring.Size = Vector3.new(0.35, d, d)
+			ring.Transparency = 0.3 + 0.7 * t
+			task.wait(0.03)
+		end
+		ring:Destroy()
+	end)
+end
+
+-- Colored spark burst (teleport / heal / meteor impact)
+local function burstFX(position, color, count)
+	for _ = 1, count or 8 do
+		local sp = Instance.new("Part")
+		sp.Name = "SkillSpark"
+		sp.Size = Vector3.new(0.3, 0.3, 0.3)
+		sp.Color = color
+		sp.Material = Enum.Material.Neon
+		sp.CanCollide = false
+		sp.Position = position
+		sp.Parent = Workspace
+		sp.AssemblyLinearVelocity = Vector3.new(
+			math.random(-10, 10), math.random(5, 14), math.random(-10, 10))
+		Debris:AddItem(sp, 0.4)
+		task.spawn(function()
+			local t0 = os.clock()
+			while sp.Parent and os.clock() - t0 < 0.35 do
+				sp.Transparency = (os.clock() - t0) / 0.35
+				task.wait(0.03)
+			end
+			if sp.Parent then sp:Destroy() end
+		end)
+	end
+end
+
+-- Ice-blue flash on slowed enemies (Frost Nova), mirrors flashEnemy
+local function frostFlash(model, data)
+	if data.frostFlashing then return end
+	data.frostFlashing = true
+	local saved = {}
+	for _, part in ipairs(model:GetChildren()) do
+		if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
+			saved[part] = part.Color
+			part.Color = Color3.fromRGB(150, 215, 255)
+		end
+	end
+	task.delay(0.3, function()
+		for part, color in pairs(saved) do
+			if part and part.Parent then
+				part.Color = color
+			end
+		end
+		data.frostFlashing = false
+	end)
+end
+
+local function nearestEnemy(player, maxDist)
+	local hrp = getHRP(player.Character)
+	if not hrp then return nil end
+	local best, bestDist = nil, maxDist
+	for model, _ in pairs(enemies) do
+		local eroot = model:FindFirstChild("HumanoidRootPart")
+		if eroot then
+			local d = horizontalDistance(hrp.Position, eroot.Position)
+			if d < bestDist then
+				bestDist = d
+				best = model
+			end
+		end
+	end
+	return best
+end
+
+local function enemiesWithin(position, radius)
+	local list = {}
+	for model, _ in pairs(enemies) do
+		local eroot = model:FindFirstChild("HumanoidRootPart")
+		if eroot and horizontalDistance(position, eroot.Position) <= radius then
+			table.insert(list, model)
+		end
+	end
+	return list
+end
+
+--====================================================================
+-- ARROWS + BOW (Archer tool; also used by Multishot)
+--====================================================================
+-- One glowing arrow, auto-aimed at targetModel (mild homing, like
+-- the fireball). With pierce=true it flies straight and damages
+-- every enemy it touches instead of dying on the first hit.
+local function launchArrow(player, targetModel, yawDeg, dmg, pierce)
+	local character = player.Character
+	local hrp = getHRP(character)
+	if not hrp then return end
+	local origin = hrp.Position + Vector3.new(0, 1.6, 0) + hrp.CFrame.LookVector * 2
+	local dir = hrp.CFrame.LookVector
+	local eroot = targetModel and targetModel:FindFirstChild("HumanoidRootPart")
+	if eroot then
+		local toT = (eroot.Position + Vector3.new(0, 1.2, 0)) - origin
+		if toT.Magnitude > 0.1 then dir = toT.Unit end
+	end
+	if yawDeg and yawDeg ~= 0 then
+		dir = CFrame.Angles(0, math.rad(yawDeg), 0) * dir
+	end
+	local arrow = Instance.new("Part")
+	arrow.Name = "ArrowProjectile"
+	arrow.Size = Vector3.new(0.15, 0.15, 2.3)
+	arrow.Color = Color3.fromRGB(255, 240, 200)
+	arrow.Material = Enum.Material.Neon
+	arrow.CanCollide = false
+	arrow.CFrame = CFrame.lookAt(origin, origin + dir)
+	arrow.Parent = Workspace
+	arrow.AssemblyLinearVelocity = dir * 115
+	Debris:AddItem(arrow, 2)
+	if targetModel and not pierce then
+		task.spawn(function()
+			local started = os.clock()
+			while arrow.Parent and os.clock() - started < 2 do
+				if not enemies[targetModel] then break end
+				local er = targetModel:FindFirstChild("HumanoidRootPart")
+				if not er then break end
+				local toT = (er.Position + Vector3.new(0, 1.2, 0)) - arrow.Position
+				if toT.Magnitude > 0.1 then
+					arrow.AssemblyLinearVelocity = toT.Unit * 115
+					arrow.CFrame = CFrame.lookAt(arrow.Position, arrow.Position + toT)
+				end
+				task.wait(0.03)
+			end
+		end)
+	end
+	local hitSet = {}
+	arrow.Touched:Connect(function(hit)
+		if not arrow.Parent then return end
+		if hit and character and hit:IsDescendantOf(character) then return end
+		local model = hit and hit.Parent
+		if model and model.Parent == enemiesFolder and enemies[model] then
+			if pierce then
+				if hitSet[model] then return end
+				hitSet[model] = true
+				damageEnemy(model, dmg, player, dir)
+			else
+				damageEnemy(model, dmg, player, dir)
+				arrow:Destroy()
+			end
+		elseif hit and hit.Anchored and not pierce then
+			arrow:Destroy()
+		end
+	end)
+end
+
+local BOW_COOLDOWN = 0.45
+local BOW_RANGE = 70
+
+local function createBowTool(player)
+	local tool = Instance.new("Tool")
+	tool.Name = "Bow"
+	tool.RequiresHandle = true
+	tool.CanBeDropped = false
+	-- modeled bow: wooden grip (Handle), two angled arms, neon string
+	local handle = Instance.new("Part")
+	handle.Name = "Handle"
+	handle.Size = Vector3.new(0.3, 1.1, 0.3)
+	handle.Color = Color3.fromRGB(105, 72, 40)
+	handle.Material = Enum.Material.Wood
+	handle.Parent = tool
+	for _, sgn in ipairs({ -1, 1 }) do
+		local arm = Instance.new("WedgePart")
+		arm.Name = "BowArm"
+		arm.Size = Vector3.new(0.22, 1.5, 0.34)
+		arm.Color = Color3.fromRGB(120, 84, 46)
+		arm.Material = Enum.Material.Wood
+		arm.CFrame = handle.CFrame * CFrame.new(0, sgn * 1.15, 0.18)
+			* CFrame.Angles(math.rad(sgn * 18), 0, 0)
+		arm.Parent = tool
+		weldTo(arm, handle)
+	end
+	local stringPart = Instance.new("Part")
+	stringPart.Name = "String"
+	stringPart.Size = Vector3.new(0.05, 3.4, 0.05)
+	stringPart.Color = Color3.fromRGB(235, 235, 225)
+	stringPart.Material = Enum.Material.Neon
+	stringPart.CFrame = handle.CFrame * CFrame.new(0, 0, 0.52)
+	stringPart.Parent = tool
+	weldTo(stringPart, handle)
+	tool.Activated:Connect(function()
+		local now = os.clock()
+		local rec = lastAction[player]
+		if not rec or (now - (rec.bow or 0)) < BOW_COOLDOWN then return end
+		local hrp = getHRP(player.Character)
+		if not hrp then return end
+		rec.bow = now
+		local target = nearestEnemy(player, BOW_RANGE)
+		local dmg = playerRangedDamage(player) * classDamageMul(player, "ranged")
+		launchArrow(player, target, 0, dmg, false)
+		playSfx("Swing", hrp, true)
+	end)
+	return tool
+end
+
+--====================================================================
+-- CLASS TOOL LOADOUTS
+--====================================================================
+local KNOWN_TOOL_PREFIXES = { "Sword", "Fireball", "Drink Potion", "Bow" }
+
+local function isLoadoutTool(tool)
+	for _, p in ipairs(KNOWN_TOOL_PREFIXES) do
+		if string.find(tool.Name, p, 1, true) then return true end
+	end
+	return false
+end
+
+local function removeAllTools(player)
+	for _, container in ipairs({ player:FindFirstChild("Backpack"), player.Character }) do
+		if container then
+			for _, item in ipairs(container:GetChildren()) do
+				if item:IsA("Tool") and isLoadoutTool(item) then
+					item:Destroy()
+				end
+			end
+		end
+	end
+end
+
+local function classLoadout(player)
+	local cid = getClassId(player)
+	if cid == "Warrior" or cid == "Paladin" then
+		return { "Sword", "Drink Potion" }
+	elseif cid == "Mage" then
+		return { "Fireball", "Drink Potion" }
+	elseif cid == "Archer" then
+		return { "Bow", "Drink Potion" }
+	end
+	return { "Sword", "Fireball", "Drink Potion" } -- no class yet: v4 trio
+end
+
+local function createToolByPrefix(player, prefix)
+	if prefix == "Sword" then return createSword(player) end
+	if prefix == "Fireball" then return createFireballTool(player) end
+	if prefix == "Bow" then return createBowTool(player) end
+	if prefix == "Drink Potion" then return createPotionTool(player) end
+	return nil
+end
+
+local function giveClassTools(player)
+	local backpack = player:FindFirstChild("Backpack")
+	if not backpack then return end
+	for _, prefix in ipairs(classLoadout(player)) do
+		local t = createToolByPrefix(player, prefix)
+		if t then t.Parent = backpack end
+	end
+	restylePlayerSword(player)
+end
+
+--====================================================================
+-- SKILL IMPLEMENTATIONS (formulas in the comments; lv = 1..5)
+--====================================================================
+-- WARRIOR 1: Whirlwind -- (120% + 20%/lv) weapon dmg, radius 9
+local function castWhirlwind(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local dmg = playerWeaponDamage(player) * (1.2 + 0.2 * lv)
+		* classDamageMul(player, "melee")
+	for _, model in ipairs(enemiesWithin(hrp.Position, 9)) do
+		local eroot = model:FindFirstChild("HumanoidRootPart")
+		local dir = nil
+		if eroot then
+			local off = eroot.Position - hrp.Position
+			if off.Magnitude > 0.1 then dir = off.Unit end
+		end
+		damageEnemy(model, dmg, player, dir)
+	end
+	playSfx("Swing", hrp, true)
+	spawnSlashFX(hrp)
+	task.delay(0.1, function() if hrp.Parent then spawnSlashFX(hrp) end end)
+	task.delay(0.2, function() if hrp.Parent then spawnSlashFX(hrp) end end)
+	-- spin the character one full turn over 0.3s
+	local startRot = hrp.CFrame - hrp.Position
+	task.spawn(function()
+		local t0 = os.clock()
+		while os.clock() - t0 < 0.3 do
+			if not hrp.Parent then return end
+			local t = (os.clock() - t0) / 0.3
+			hrp.CFrame = CFrame.new(hrp.Position) * startRot
+				* CFrame.Angles(0, math.rad(360 * t), 0)
+			task.wait(0.03)
+		end
+		if hrp.Parent then
+			hrp.CFrame = CFrame.new(hrp.Position) * startRot
+		end
+	end)
+end
+
+-- WARRIOR 2: Charge -- dash up to 16 studs, (100% + 25%/lv) weapon
+-- dmg to every enemy passed through
+local function castCharge(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local target = nearestEnemy(player, 40)
+	local dir = hrp.CFrame.LookVector
+	local dist = 16
+	if target then
+		local eroot = target:FindFirstChild("HumanoidRootPart")
+		if eroot then
+			local off = Vector3.new(eroot.Position.X - hrp.Position.X, 0,
+				eroot.Position.Z - hrp.Position.Z)
+			if off.Magnitude > 0.1 then
+				dir = off.Unit
+				dist = math.clamp(off.Magnitude - 3, 2, 16)
+			end
+		end
+	end
+	hrp.CFrame = CFrame.lookAt(hrp.Position, hrp.Position + dir)
+	local dmg = playerWeaponDamage(player) * (1.0 + 0.25 * lv)
+		* classDamageMul(player, "melee")
+	local startPos = hrp.Position
+	local startRot = hrp.CFrame - hrp.Position
+	local hitSet = {}
+	playSfx("Swing", hrp, true)
+	task.spawn(function()
+		local t0 = os.clock()
+		local dur = 0.18
+		while os.clock() - t0 < dur do
+			if not hrp.Parent then return end
+			local t = (os.clock() - t0) / dur
+			hrp.CFrame = CFrame.new(startPos + dir * (dist * t)) * startRot
+			for _, model in ipairs(enemiesWithin(hrp.Position, 4)) do
+				if not hitSet[model] then
+					hitSet[model] = true
+					damageEnemy(model, dmg, player, dir)
+				end
+			end
+			task.wait(0.02)
+		end
+	end)
+end
+
+-- WARRIOR 3: War Cry -- 10s self buff: +(15% + 3%/lv) damage,
+-- +(10% + 2%/lv) damage reduction (read by the mul functions)
+local function castWarCry(player, lv)
+	buffs[player] = {
+		dmgMul = 1 + (0.15 + 0.03 * lv),
+		defRed = 0.10 + 0.02 * lv,
+		expires = os.clock() + 10,
+	}
+	local hrp = getHRP(player.Character)
+	if hrp then
+		ringFX(hrp.Position, 8, Color3.fromRGB(255, 200, 80))
+		playSfx("LevelUp", hrp)
+	end
+	showToast(player, "War Cry! +" .. math.floor((0.15 + 0.03 * lv) * 100)
+		.. "% damage for 10s", 2)
+end
+
+-- MAGE 1: Frost Nova -- (60% + 15%/lv) spell dmg, radius 11, and
+-- SLOW 50% for (2 + 0.3/lv) s (data.slowUntil / slowFactor, AI loop)
+local function castFrostNova(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local dmg = playerSpellDamage(player) * (0.6 + 0.15 * lv)
+		* classDamageMul(player, "spell")
+	local slowTime = 2 + 0.3 * lv
+	for _, model in ipairs(enemiesWithin(hrp.Position, 11)) do
+		local data = enemies[model]
+		if data then
+			data.slowUntil = os.clock() + slowTime
+			data.slowFactor = 0.5
+			frostFlash(model, data)
+		end
+		damageEnemy(model, dmg, player, nil)
+	end
+	ringFX(hrp.Position, 11, Color3.fromRGB(130, 200, 255))
+	playSfx("Hit", hrp, true)
+end
+
+-- MAGE 2: Meteor -- telegraph 0.8s at the target's position, then
+-- (200% + 40%/lv) spell dmg in radius 9
+local function castMeteor(player, lv, target)
+	local eroot = target and target:FindFirstChild("HumanoidRootPart")
+	if not eroot then return end
+	local impactPos = Vector3.new(eroot.Position.X, 0, eroot.Position.Z)
+	local tele = Instance.new("Part")
+	tele.Name = "MeteorTelegraph"
+	tele.Shape = Enum.PartType.Cylinder
+	tele.Size = Vector3.new(0.3, 18, 18)
+	tele.CFrame = CFrame.new(impactPos.X, 0.35, impactPos.Z)
+		* CFrame.Angles(0, 0, math.rad(90))
+	tele.Color = Color3.fromRGB(255, 70, 50)
+	tele.Material = Enum.Material.Neon
+	tele.Transparency = 0.55
+	tele.Anchored = true
+	tele.CanCollide = false
+	tele.Parent = Workspace
+	Debris:AddItem(tele, 1)
+	local rock = Instance.new("Part")
+	rock.Name = "MeteorRock"
+	rock.Shape = Enum.PartType.Ball
+	rock.Size = Vector3.new(2.6, 2.6, 2.6)
+	rock.Color = Color3.fromRGB(255, 140, 50)
+	rock.Material = Enum.Material.Neon
+	rock.CanCollide = false
+	rock.Position = impactPos + Vector3.new(0, 24, 0)
+	rock.Parent = Workspace
+	local rl = Instance.new("PointLight")
+	rl.Color = Color3.fromRGB(255, 150, 60)
+	rl.Range = 16
+	rl.Brightness = 2.5
+	rl.Parent = rock
+	rock.AssemblyLinearVelocity = Vector3.new(0, -30, 0)
+	Debris:AddItem(rock, 0.85)
+	task.delay(0.8, function()
+		if tele.Parent then tele:Destroy() end
+		local dmg = playerSpellDamage(player) * (2.0 + 0.4 * lv)
+			* classDamageMul(player, "spell")
+		for _, model in ipairs(enemiesWithin(impactPos, 9)) do
+			damageEnemy(model, dmg, player, nil)
+		end
+		ringFX(impactPos, 9, Color3.fromRGB(255, 130, 50))
+		burstFX(impactPos + Vector3.new(0, 2, 0), Color3.fromRGB(255, 150, 60), 14)
+		playSfx("Hit", getHRP(player.Character), true)
+	end)
+end
+
+-- MAGE 3: Teleport -- blink 18 studs toward facing / nearest enemy,
+-- clamped inside the dungeon walls when cast in the dungeon
+local function castTeleport(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local dir = hrp.CFrame.LookVector
+	local target = nearestEnemy(player, 40)
+	if target then
+		local eroot = target:FindFirstChild("HumanoidRootPart")
+		if eroot then
+			local off = Vector3.new(eroot.Position.X - hrp.Position.X, 0,
+				eroot.Position.Z - hrp.Position.Z)
+			if off.Magnitude > 0.1 then dir = off.Unit end
+		end
+	end
+	burstFX(hrp.Position + Vector3.new(0, 1.5, 0), Color3.fromRGB(170, 120, 255), 10)
+	local newPos = hrp.Position + dir * 18
+	if inDungeon(hrp.Position) then
+		newPos = Vector3.new(
+			math.clamp(newPos.X, DUNGEON_CENTER.X - DUNGEON_HALF_X + 3,
+				DUNGEON_CENTER.X + DUNGEON_HALF_X - 3),
+			hrp.Position.Y,
+			math.clamp(newPos.Z, DUNGEON_CENTER.Z - DUNGEON_HALF_Z + 3,
+				DUNGEON_CENTER.Z + DUNGEON_HALF_Z - 3))
+	end
+	hrp.CFrame = CFrame.new(newPos) * (hrp.CFrame - hrp.Position)
+	hrp.AssemblyLinearVelocity = Vector3.zero
+	burstFX(newPos + Vector3.new(0, 1.5, 0), Color3.fromRGB(170, 120, 255), 10)
+	playSfx("Equip", hrp)
+end
+
+-- ARCHER 1: Multishot -- (3 + 1 per 2 levels) arrows in a fan,
+-- each 80% ranged dmg
+local function castMultishot(player, lv, target)
+	local count = 3 + math.floor(lv / 2)
+	local dmg = playerRangedDamage(player) * 0.8
+		* classDamageMul(player, "ranged")
+	for i = 1, count do
+		local offset = (i - (count + 1) / 2) * 7 -- degrees of fan spread
+		launchArrow(player, target, offset, dmg, false)
+	end
+	playSfx("Swing", getHRP(player.Character), true)
+end
+
+-- ARCHER 2: Piercing Shot -- hitscan line, (150% + 30%/lv) ranged
+-- dmg to EVERY enemy within 3.5 studs of the shot line (60 long)
+local function castPiercingShot(player, lv, target)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local origin = hrp.Position + Vector3.new(0, 1.6, 0)
+	local dir = hrp.CFrame.LookVector
+	local eroot = target and target:FindFirstChild("HumanoidRootPart")
+	if eroot then
+		local flat = Vector3.new(eroot.Position.X - origin.X, 0,
+			eroot.Position.Z - origin.Z)
+		if flat.Magnitude > 0.1 then dir = flat.Unit end
+	end
+	local dmg = playerRangedDamage(player) * (1.5 + 0.3 * lv)
+		* classDamageMul(player, "ranged")
+	local LENGTH = 60
+	for model, _ in pairs(enemies) do
+		local er = model:FindFirstChild("HumanoidRootPart")
+		if er then
+			local rel = Vector3.new(er.Position.X - origin.X, 0,
+				er.Position.Z - origin.Z)
+			local along = rel:Dot(dir)
+			if along > 0 and along < LENGTH then
+				local closest = origin + dir * along
+				if horizontalDistance(er.Position, closest) <= 3.5 then
+					damageEnemy(model, dmg, player, dir)
+				end
+			end
+		end
+	end
+	local tracer = Instance.new("Part")
+	tracer.Name = "PierceTracer"
+	tracer.Size = Vector3.new(0.22, 0.22, LENGTH)
+	tracer.Color = Color3.fromRGB(255, 240, 180)
+	tracer.Material = Enum.Material.Neon
+	tracer.Anchored = true
+	tracer.CanCollide = false
+	tracer.CFrame = CFrame.lookAt(origin + dir * (LENGTH / 2), origin + dir * LENGTH)
+	tracer.Parent = Workspace
+	Debris:AddItem(tracer, 0.25)
+	task.spawn(function()
+		local t0 = os.clock()
+		while tracer.Parent and os.clock() - t0 < 0.22 do
+			tracer.Transparency = (os.clock() - t0) / 0.22
+			task.wait(0.03)
+		end
+		if tracer.Parent then tracer:Destroy() end
+	end)
+	playSfx("Swing", hrp, true)
+end
+
+-- ARCHER 3: Arrow Rain -- telegraph ring, then 5 waves over 1.5s
+-- on the target cluster (radius 10), each wave (40% + 10%/lv)
+local function castArrowRain(player, lv, target)
+	local eroot = target and target:FindFirstChild("HumanoidRootPart")
+	if not eroot then return end
+	local center = Vector3.new(eroot.Position.X, 0, eroot.Position.Z)
+	ringFX(center, 10, Color3.fromRGB(255, 190, 90), 0.5)
+	local dmg = playerRangedDamage(player) * (0.4 + 0.1 * lv)
+		* classDamageMul(player, "ranged")
+	task.spawn(function()
+		for _ = 1, 5 do
+			for _ = 1, 7 do
+				local a = Instance.new("Part")
+				a.Name = "RainArrow"
+				a.Size = Vector3.new(0.14, 0.14, 2)
+				a.Color = Color3.fromRGB(255, 240, 200)
+				a.Material = Enum.Material.Neon
+				a.CanCollide = false
+				a.Position = Vector3.new(
+					center.X + math.random(-9, 9), center.Y + 20,
+					center.Z + math.random(-9, 9))
+				a.CFrame = CFrame.new(a.Position) * CFrame.Angles(math.rad(90), 0, 0)
+				a.Parent = Workspace
+				a.AssemblyLinearVelocity = Vector3.new(0, -55, 0)
+				Debris:AddItem(a, 0.45)
+			end
+			for _, model in ipairs(enemiesWithin(center, 10)) do
+				damageEnemy(model, dmg, player, nil)
+			end
+			playSfx("Hit", getHRP(player.Character), true)
+			task.wait(0.3)
+		end
+	end)
+end
+
+-- PALADIN 1: Blessed Hammer -- a hammer orbits the player for
+-- (4 + 0.5/lv) s, hitting enemies it touches every 0.4s for
+-- (70% + 15%/lv) weapon dmg
+local function castBlessedHammer(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local duration = 4 + 0.5 * lv
+	local dmg = playerWeaponDamage(player) * (0.7 + 0.15 * lv)
+		* classDamageMul(player, "melee")
+	local hammer = Instance.new("Part")
+	hammer.Name = "BlessedHammer"
+	hammer.Size = Vector3.new(1.1, 1.6, 1.1)
+	hammer.Color = Color3.fromRGB(255, 215, 110)
+	hammer.Material = Enum.Material.Neon
+	hammer.CanCollide = false
+	hammer.Anchored = true
+	hammer.Position = hrp.Position + Vector3.new(5.5, 1.4, 0)
+	hammer.Parent = Workspace
+	local light = Instance.new("PointLight")
+	light.Color = Color3.fromRGB(255, 215, 110)
+	light.Range = 11
+	light.Brightness = 2
+	light.Parent = hammer
+	playSfx("Swing", hrp, true)
+	task.spawn(function()
+		local t0 = os.clock()
+		local lastHit = 0
+		while os.clock() - t0 < duration do
+			local h = getHRP(player.Character)
+			if not h or not hammer.Parent then break end
+			local ang = (os.clock() - t0) * 2.6
+			local pos = h.Position + Vector3.new(
+				math.cos(ang) * 5.5, 1.4, math.sin(ang) * 5.5)
+			hammer.CFrame = CFrame.new(pos) * CFrame.Angles(0, -ang, math.rad(35))
+			if os.clock() - lastHit >= 0.4 then
+				lastHit = os.clock()
+				for _, model in ipairs(enemiesWithin(pos, 3.2)) do
+					damageEnemy(model, dmg, player, nil)
+				end
+			end
+			task.wait(0.04)
+		end
+		hammer:Destroy()
+	end)
+end
+
+-- PALADIN 2: Heal -- restore (25% + 5%/lv) MaxHP to self and every
+-- ally within 14 studs
+local function castHeal(player, lv)
+	local hrp = getHRP(player.Character)
+	if not hrp then return end
+	local frac = 0.25 + 0.05 * lv
+	for _, p in ipairs(Players:GetPlayers()) do
+		local hum = getHumanoid(p.Character)
+		local phrp = getHRP(p.Character)
+		if hum and phrp and hum.Health > 0
+			and horizontalDistance(hrp.Position, phrp.Position) <= 14 then
+			hum.Health = math.min(hum.MaxHealth, hum.Health + hum.MaxHealth * frac)
+			burstFX(phrp.Position + Vector3.new(0, 2, 0),
+				Color3.fromRGB(110, 255, 150), 8)
+		end
+	end
+	ringFX(hrp.Position, 14, Color3.fromRGB(110, 255, 150))
+	playSfx("LevelUp", hrp)
+end
+
+-- Description helper: current-level text + next-level text
+local function d2(curText, nextText, lv)
+	if lv >= 5 then return curText .. " (MAX)" end
+	if lv >= 1 then return curText .. "\nNext: " .. nextText end
+	return nextText
+end
+
+-- Skill definitions: cd / mana are flat per cast; needsTarget =
+-- max range for skills that require an enemy (validated BEFORE
+-- mana + cooldown are charged). Thorns Aura is a toggle.
+local SKILLS = {
+	Warrior = {
+		{ name = "Whirlwind", cd = 6, mana = 15, cast = castWhirlwind, desc = function(lv)
+			return d2("Spin: " .. (120 + 20 * lv) .. "% weapon dmg to all enemies within 9",
+				"Spin: " .. (120 + 20 * (lv + 1)) .. "% weapon dmg to all enemies within 9", lv)
+		end },
+		{ name = "Charge", cd = 8, mana = 10, cast = castCharge, desc = function(lv)
+			return d2("Dash 16 studs: " .. (100 + 25 * lv) .. "% weapon dmg to enemies passed through",
+				"Dash 16 studs: " .. (100 + 25 * (lv + 1)) .. "% weapon dmg to enemies passed through", lv)
+		end },
+		{ name = "War Cry", cd = 20, mana = 20, cast = castWarCry, desc = function(lv)
+			return d2("Buff 10s: +" .. (15 + 3 * lv) .. "% damage, +" .. (10 + 2 * lv) .. "% defense",
+				"Buff 10s: +" .. (15 + 3 * (lv + 1)) .. "% damage, +" .. (10 + 2 * (lv + 1)) .. "% defense", lv)
+		end },
+	},
+	Mage = {
+		{ name = "Frost Nova", cd = 9, mana = 25, cast = castFrostNova, desc = function(lv)
+			return d2((60 + 15 * lv) .. "% spell dmg, radius 11, slow 50% for " .. (2 + 0.3 * lv) .. "s",
+				(60 + 15 * (lv + 1)) .. "% spell dmg, radius 11, slow 50% for " .. (2 + 0.3 * (lv + 1)) .. "s", lv)
+		end },
+		{ name = "Meteor", cd = 12, mana = 35, needsTarget = 60, cast = castMeteor, desc = function(lv)
+			return d2("After 0.8s: " .. (200 + 40 * lv) .. "% spell dmg in radius 9 at the target",
+				"After 0.8s: " .. (200 + 40 * (lv + 1)) .. "% spell dmg in radius 9 at the target", lv)
+		end },
+		{ name = "Teleport", cd = 7, mana = 15, cast = castTeleport, desc = function(_)
+			return "Blink 18 studs toward your facing (or the nearest enemy)."
+		end },
+	},
+	Archer = {
+		{ name = "Multishot", cd = 7, mana = 15, needsTarget = 70, cast = castMultishot, desc = function(lv)
+			return d2("Fire " .. (3 + math.floor(lv / 2)) .. " arrows in a fan, 80% ranged dmg each",
+				"Fire " .. (3 + math.floor((lv + 1) / 2)) .. " arrows in a fan, 80% ranged dmg each", lv)
+		end },
+		{ name = "Piercing Shot", cd = 9, mana = 20, needsTarget = 70, cast = castPiercingShot, desc = function(lv)
+			return d2((150 + 30 * lv) .. "% ranged dmg to ALL enemies along the shot line",
+				(150 + 30 * (lv + 1)) .. "% ranged dmg to ALL enemies along the shot line", lv)
+		end },
+		{ name = "Arrow Rain", cd = 14, mana = 30, needsTarget = 60, cast = castArrowRain, desc = function(lv)
+			return d2("5 waves over 1.5s: " .. (40 + 10 * lv) .. "% ranged dmg each, radius 10",
+				"5 waves over 1.5s: " .. (40 + 10 * (lv + 1)) .. "% ranged dmg each, radius 10", lv)
+		end },
+	},
+	Paladin = {
+		{ name = "Blessed Hammer", cd = 12, mana = 20, cast = castBlessedHammer, desc = function(lv)
+			return d2("Orbiting hammer for " .. (4 + 0.5 * lv) .. "s: " .. (70 + 15 * lv) .. "% weapon dmg per hit",
+				"Orbiting hammer for " .. (4 + 0.5 * (lv + 1)) .. "s: " .. (70 + 15 * (lv + 1)) .. "% weapon dmg per hit", lv)
+		end },
+		{ name = "Heal", cd = 15, mana = 25, cast = castHeal, desc = function(lv)
+			return d2("Heal self + allies within 14 for " .. (25 + 5 * lv) .. "% of MaxHP",
+				"Heal self + allies within 14 for " .. (25 + 5 * (lv + 1)) .. "% of MaxHP", lv)
+		end },
+		{ name = "Thorns Aura", cd = 0, mana = 0, toggle = true, desc = function(lv)
+			return d2("Aura: reflect " .. (6 + 4 * lv) .. "% of enemy melee damage back",
+				"Aura: reflect " .. (6 + 4 * (lv + 1)) .. "% of enemy melee damage back", lv)
+				.. "\nToggle it from the skill bar / R key."
+		end },
+	},
+}
+
+-- Thorns Aura visual: a faint gold ring welded under the player,
+-- rebuilt on toggle / respawn / class change.
+local function refreshThornsAura(player)
+	local character = player.Character
+	if not character then return end
+	local old = character:FindFirstChild("ThornsAura")
+	if old then old:Destroy() end
+	local st = skillState[player]
+	if not st or not st.thornsOn then return end
+	if getClassId(player) ~= "Paladin" then return end
+	local hrp = getHRP(character)
+	if not hrp then return end
+	local ring = Instance.new("Part")
+	ring.Name = "ThornsAura"
+	ring.Shape = Enum.PartType.Cylinder
+	ring.Size = Vector3.new(0.25, 7, 7)
+	ring.Color = Color3.fromRGB(255, 205, 90)
+	ring.Material = Enum.Material.Neon
+	ring.Transparency = 0.65
+	ring.CFrame = hrp.CFrame * CFrame.new(0, -2.7, 0)
+		* CFrame.Angles(0, 0, math.rad(90))
+	ring.Parent = character
+	weldGearPart(ring, hrp)
+end
+
+--====================================================================
+-- CLASS + SKILLS UI (server-built; clicks arrive via UIEvent)
+--====================================================================
+local CLASS_PITCH = {
+	Warrior = "HP x1.4\nMelee x1.25\nMana x0.7",
+	Mage = "Spell x1.4\nMana x1.8\nHP x0.75",
+	Archer = "Ranged x1.3\nSpeed 17.5\nHP x0.95",
+	Paladin = "HP x1.2\nMelee x1.05\nMana x1.1\n-5% dmg taken",
+}
+
+local function buildClassUI(player)
+	local playerGui = player:WaitForChild("PlayerGui")
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "ShiningClass"
+	gui.ResetOnSpawn = false
+	gui.Parent = playerGui
+
+	local classButton = Instance.new("TextButton")
+	classButton.Name = "ClassButton"
+	classButton.Size = UDim2.new(0, 110, 0, 36)
+	classButton.Position = UDim2.new(0, 12, 0, 248)
+	classButton.Text = "Class"
+	classButton.Font = Enum.Font.GothamBold
+	classButton.TextSize = 16
+	classButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+	classButton.BackgroundColor3 = Color3.fromRGB(64, 48, 32)
+	classButton.BackgroundTransparency = 0.15
+	classButton.BorderSizePixel = 0
+	classButton:SetAttribute("Act", "ToggleClass")
+	classButton.Parent = gui
+
+	-- class select panel: 4 cards, click one to take that class
+	local panel = Instance.new("Frame")
+	panel.Name = "ClassPanel"
+	panel.Size = UDim2.new(0, 620, 0, 380)
+	panel.Position = UDim2.new(0.5, -310, 0.5, -190)
+	panel.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+	panel.BackgroundTransparency = 0.08
+	panel.BorderSizePixel = 0
+	panel.Visible = false
+	panel.Parent = gui
+	makeLabel(panel, "Title", UDim2.new(1, -20, 0, 30), UDim2.new(0, 10, 0, 8),
+		"CHOOSE YOUR CLASS", 20, Color3.fromRGB(255, 230, 160))
+	local classButtons = {}
+	for i, cid in ipairs(CLASS_IDS) do
+		local def = CLASS_DEFS[cid]
+		local skillNames = {}
+		for _, s in ipairs(SKILLS[cid]) do
+			table.insert(skillNames, s.name)
+		end
+		local b = Instance.new("TextButton")
+		b.Name = "Class_" .. cid
+		b.Size = UDim2.new(0, 140, 0, 250)
+		b.Position = UDim2.new(0, 14 + (i - 1) * 150, 0, 48)
+		b.Font = Enum.Font.Gotham
+		b.TextSize = 13
+		b.TextWrapped = true
+		b.TextYAlignment = Enum.TextYAlignment.Top
+		b.Text = def.name .. " (" .. def.cn .. ")\n\n" .. CLASS_PITCH[cid]
+			.. "\n\n-- Skills --\n" .. table.concat(skillNames, "\n")
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.BackgroundColor3 = Color3.fromRGB(38, 38, 54)
+		b.BorderSizePixel = 0
+		b:SetAttribute("Act", "ChooseClass")
+		b:SetAttribute("Arg", cid)
+		b.Parent = panel
+		classButtons[cid] = b
+	end
+	local note = makeLabel(panel, "Note", UDim2.new(1, -20, 0, 40),
+		UDim2.new(0, 10, 0, 312),
+		"Changing class keeps your level, gold and gear.\nSkill levels are saved per class.",
+		13, Color3.fromRGB(170, 170, 185))
+	note.TextWrapped = true
+
+	-- skills panel (contents rebuilt by refreshSkillsUI)
+	local skillsPanel = Instance.new("Frame")
+	skillsPanel.Name = "SkillsPanel"
+	skillsPanel.Size = UDim2.new(0, 500, 0, 360)
+	skillsPanel.Position = UDim2.new(0.5, -250, 0.5, -180)
+	skillsPanel.BackgroundColor3 = Color3.fromRGB(18, 18, 28)
+	skillsPanel.BackgroundTransparency = 0.08
+	skillsPanel.BorderSizePixel = 0
+	skillsPanel.Visible = false
+	skillsPanel.Parent = gui
+
+	-- skill bar: 3 cast buttons, bottom center-right of the toolbar
+	local bar = Instance.new("Frame")
+	bar.Name = "SkillBar"
+	bar.Size = UDim2.new(0, 306, 0, 62)
+	bar.Position = UDim2.new(0.5, 130, 1, -76)
+	bar.BackgroundTransparency = 1
+	bar.BorderSizePixel = 0
+	bar.Parent = gui
+	local barButtons = {}
+	for i = 1, 3 do
+		local b = Instance.new("TextButton")
+		b.Name = "Skill" .. i
+		b.Size = UDim2.new(0, 98, 0, 62)
+		b.Position = UDim2.new(0, (i - 1) * 104, 0, 0)
+		b.Font = Enum.Font.GothamBold
+		b.TextSize = 12
+		b.TextWrapped = true
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.BackgroundColor3 = Color3.fromRGB(30, 30, 46)
+		b.BackgroundTransparency = 0.15
+		b.BorderSizePixel = 0
+		b:SetAttribute("Act", "CastSkill")
+		b:SetAttribute("Arg", tostring(i))
+		b.Parent = bar
+		barButtons[i] = b
+	end
+
+	classRefs[player] = {
+		gui = gui, panel = panel, skillsPanel = skillsPanel,
+		classButtons = classButtons,
+	}
+	skillBarRefs[player] = { buttons = barButtons }
+end
+
+local function skillBarText(player, i)
+	local classId = getClassId(player)
+	if classId == "" then return "No class" end
+	local def = SKILLS[classId][i]
+	if not def then return "" end
+	local lv = getSkillLevel(player, classId, i)
+	if def.toggle then
+		local st = skillState[player]
+		return def.name .. "\n" .. (st and st.thornsOn and "ON" or "OFF")
+			.. " [" .. HOTKEYS[i] .. "]"
+	end
+	if lv < 1 then
+		return def.name .. "\nLocked [" .. HOTKEYS[i] .. "]"
+	end
+	local st = skillState[player]
+	local remain = 0
+	if st then
+		remain = (st.cooldowns[classId .. i] or 0) - os.clock()
+	end
+	if remain > 0 then
+		return def.name .. "\n" .. math.ceil(remain) .. "s [" .. HOTKEYS[i] .. "]"
+	end
+	return def.name .. "\nLv " .. lv .. " [" .. HOTKEYS[i] .. "]"
+end
+
+local function updateSkillBar(player)
+	local refs = skillBarRefs[player]
+	if not refs then return end
+	for i = 1, 3 do
+		local b = refs.buttons[i]
+		if b then b.Text = skillBarText(player, i) end
+	end
+end
+
+local function refreshSkillsUI(player)
+	local refs = classRefs[player]
+	if not refs then return end
+	local panel = refs.skillsPanel
+	panel.Visible = skillsOpen[player] and true or false
+	for _, child in ipairs(panel:GetChildren()) do
+		child:Destroy()
+	end
+	local classId = getClassId(player)
+	local sp = getStat(player, "Stats", "SkillPoints")
+	local points = sp and sp.Value or 0
+	local title = "SKILLS"
+	if classId ~= "" then
+		title = title .. " - " .. CLASS_DEFS[classId].name
+	end
+	makeLabel(panel, "Title", UDim2.new(1, -20, 0, 26), UDim2.new(0, 10, 0, 6),
+		title, 18, Color3.fromRGB(255, 230, 160))
+	makeLabel(panel, "Points", UDim2.new(1, -20, 0, 22), UDim2.new(0, 10, 0, 34),
+		"Skill Points: " .. points .. "  (earn 1 per level-up)", 14,
+		Color3.fromRGB(180, 220, 255))
+	if classId == "" then
+		makeLabel(panel, "NoClass", UDim2.new(1, -20, 0, 30), UDim2.new(0, 10, 0, 80),
+			"Choose a class first (Class button, left side).", 15,
+			Color3.fromRGB(200, 200, 210))
+		return
+	end
+	for i = 1, 3 do
+		local def = SKILLS[classId][i]
+		local lv = getSkillLevel(player, classId, i)
+		local y = 66 + (i - 1) * 84
+		local pips = string.rep("●", lv) .. string.rep("○", 5 - lv)
+		makeLabel(panel, "SkillName" .. i, UDim2.new(1, -70, 0, 22),
+			UDim2.new(0, 10, 0, y),
+			def.name .. "   Lv " .. lv .. "/5  " .. pips, 15,
+			Color3.fromRGB(255, 255, 255))
+		local meta
+		if def.toggle then
+			meta = "Toggle aura - no mana, no cooldown - Hotkey " .. HOTKEYS[i]
+		else
+			meta = "CD " .. def.cd .. "s   Mana " .. def.mana
+				.. "   Hotkey " .. HOTKEYS[i]
+		end
+		makeLabel(panel, "SkillMeta" .. i, UDim2.new(1, -70, 0, 18),
+			UDim2.new(0, 10, 0, y + 22), meta, 12,
+			Color3.fromRGB(160, 175, 200))
+		local descLabel = makeLabel(panel, "SkillDesc" .. i,
+			UDim2.new(1, -70, 0, 40), UDim2.new(0, 10, 0, y + 40),
+			def.desc(lv), 12, Color3.fromRGB(200, 205, 215))
+		descLabel.Font = Enum.Font.Gotham
+		descLabel.TextWrapped = true
+		descLabel.TextYAlignment = Enum.TextYAlignment.Top
+		local canUp = points > 0 and lv < 5
+		local up = Instance.new("TextButton")
+		up.Name = "SkillUp" .. i
+		up.Size = UDim2.new(0, 44, 0, 44)
+		up.Position = UDim2.new(1, -56, 0, y + 6)
+		up.Text = "+"
+		up.Font = Enum.Font.GothamBold
+		up.TextSize = 24
+		up.TextColor3 = Color3.fromRGB(255, 255, 255)
+		up.BackgroundColor3 = canUp and Color3.fromRGB(60, 130, 60)
+			or Color3.fromRGB(45, 45, 58)
+		up.BorderSizePixel = 0
+		up:SetAttribute("Act", "SkillUp")
+		up:SetAttribute("Arg", tostring(i))
+		up.Parent = panel
+	end
+	makeLabel(panel, "Hint", UDim2.new(1, -20, 0, 20), UDim2.new(0, 10, 0, 330),
+		"Cast skills with Q / E / R or the skill bar.", 12,
+		Color3.fromRGB(150, 150, 165))
+end
+
+local function refreshClassUI(player)
+	local refs = classRefs[player]
+	if not refs then return end
+	refs.panel.Visible = classPanelOpen[player] and true or false
+	local classId = getClassId(player)
+	for cid, b in pairs(refs.classButtons) do
+		if cid == classId then
+			b.BackgroundColor3 = Color3.fromRGB(62, 105, 55)
+		else
+			b.BackgroundColor3 = Color3.fromRGB(38, 38, 54)
+		end
+	end
+	refreshSkillsUI(player)
+	updateSkillBar(player)
+end
+
+--====================================================================
+-- CLASS ACTIONS
+--====================================================================
+local function chooseClass(player, classId)
+	if not CLASS_DEFS[classId] then return end
+	local classVal = getStat(player, "Stats", "Class")
+	if not classVal then return end
+	classVal.Value = classId
+	-- swap to the class's tool loadout (level + gear untouched)
+	removeAllTools(player)
+	giveClassTools(player)
+	-- the new class may have a smaller mana pool: clamp
+	local mana = getStat(player, "Stats", "Mana")
+	if mana then mana.Value = math.min(mana.Value, maxManaFor(player)) end
+	-- re-apply HP cap / walk speed / worn gear under the new mods
+	applyGear(player)
+	refreshThornsAura(player) -- aura ring only exists for Paladins
+	classPanelOpen[player] = false
+	refreshClassUI(player)
+	playSfx("Equip", getHRP(player.Character))
+	local def = CLASS_DEFS[classId]
+	showToast(player, "Class: " .. def.name .. " (" .. def.cn .. ")", 3)
+end
+
+local function skillUp(player, idx)
+	local classId = getClassId(player)
+	if classId == "" then
+		showToast(player, "Choose a class first!", 2)
+		return
+	end
+	if idx < 1 or idx > 3 then return end
+	local st = skillState[player]
+	if not st then return end
+	if st.skills[classId][idx] >= 5 then
+		showToast(player, "Skill is already max level!", 2)
+		return
+	end
+	local sp = getStat(player, "Stats", "SkillPoints")
+	if not sp or sp.Value < 1 then
+		showToast(player, "No skill points! Level up to earn more.", 2)
+		return
+	end
+	st.skills[classId][idx] = st.skills[classId][idx] + 1
+	sp.Value = sp.Value - 1
+	playSfx("LevelUp", getHRP(player.Character))
+	showToast(player, SKILLS[classId][idx].name .. " -> Lv "
+		.. st.skills[classId][idx], 2)
+	refreshClassUI(player)
+end
+
+local function castSkill(player, idx)
+	local classId = getClassId(player)
+	if classId == "" then
+		showToast(player, "Choose a class first!", 2)
+		return
+	end
+	local defs = SKILLS[classId]
+	local def = defs and defs[idx]
+	if not def then return end
+	local st = skillState[player]
+	if not st then return end
+	local lv = getSkillLevel(player, classId, idx)
+	-- Thorns Aura: a toggle, no mana / cooldown, still needs Lv >= 1
+	if def.toggle then
+		if lv < 1 then
+			showToast(player, "Learn " .. def.name .. " first!", 2)
+			return
+		end
+		st.thornsOn = not st.thornsOn
+		refreshThornsAura(player)
+		updateSkillBar(player)
+		showToast(player, def.name .. (st.thornsOn and " ON" or " OFF"), 1.5)
+		playSfx("Equip", getHRP(player.Character))
+		return
+	end
+	if lv < 1 then
+		showToast(player, def.name .. " is not learned yet - open Skills!", 2)
+		return
+	end
+	local now = os.clock()
+	local cdKey = classId .. idx
+	if st.cooldowns[cdKey] and now < st.cooldowns[cdKey] then return end
+	-- target-required skills validate BEFORE mana/cooldown are spent
+	local target = nil
+	if def.needsTarget then
+		target = nearestEnemy(player, def.needsTarget)
+		if not target then
+			showToast(player, "No enemy in range!", 2)
+			return
+		end
+	end
+	local mana = getStat(player, "Stats", "Mana")
+	if not mana or mana.Value < def.mana then
+		showToast(player, "Not enough mana!", 2)
+		return
+	end
+	mana.Value = mana.Value - def.mana
+	st.cooldowns[cdKey] = now + def.cd
+	def.cast(player, lv, target)
+	updateSkillBar(player)
+end
+
+uiEvent.OnServerEvent:Connect(function(player, act, arg)
+	if type(act) ~= "string" then return end
+	if act == "ToggleClass" then
+		classPanelOpen[player] = not classPanelOpen[player]
+		if classPanelOpen[player] then skillsOpen[player] = false end
+		refreshClassUI(player)
+	elseif act == "ChooseClass" then
+		if type(arg) == "string" then chooseClass(player, arg) end
+	elseif act == "ToggleSkills" then
+		skillsOpen[player] = not skillsOpen[player]
+		if skillsOpen[player] then classPanelOpen[player] = false end
+		refreshClassUI(player)
+	elseif act == "SkillUp" then
+		local idx = tonumber(arg)
+		if idx then skillUp(player, math.floor(idx)) end
+	elseif act == "CastSkill" then
+		local idx = tonumber(arg)
+		if idx then castSkill(player, math.floor(idx)) end
+	end
+end)
+
+--====================================================================
 -- SHOP PROMPTS
 --====================================================================
 local function setupShop()
@@ -2633,6 +3932,28 @@ local function ensureTools(player)
 	local backpack = player:FindFirstChild("Backpack")
 	if not backpack then return end
 	local character = player.Character
+	-- v5: the loadout follows the chosen class. With a class set,
+	-- tools outside the loadout are removed (class swaps stay
+	-- clean); without a class the v4 trio (sword/staff/potion) is
+	-- kept so new players can fight before choosing.
+	local desired = classLoadout(player)
+	local function isDesired(toolName)
+		for _, prefix in ipairs(desired) do
+			if string.find(toolName, prefix, 1, true) then return true end
+		end
+		return false
+	end
+	if getClassId(player) ~= "" then
+		for _, container in ipairs({ backpack, character }) do
+			if container then
+				for _, item in ipairs(container:GetChildren()) do
+					if item:IsA("Tool") and not isDesired(item.Name) then
+						item:Destroy()
+					end
+				end
+			end
+		end
+	end
 	local function hasTool(prefix)
 		for _, container in ipairs({ backpack, character }) do
 			if container then
@@ -2645,13 +3966,13 @@ local function ensureTools(player)
 		end
 		return false
 	end
-	if not hasTool("Sword") then
-		local sword = createSword(player)
-		sword.Parent = backpack
-		restylePlayerSword(player)
+	for _, prefix in ipairs(desired) do
+		if not hasTool(prefix) then
+			local tool = createToolByPrefix(player, prefix)
+			if tool then tool.Parent = backpack end
+		end
 	end
-	if not hasTool("Fireball") then createFireballTool(player).Parent = backpack end
-	if not hasTool("Drink Potion") then createPotionTool(player).Parent = backpack end
+	restylePlayerSword(player)
 end
 
 local function onCharacterAdded(player, character)
@@ -2669,6 +3990,8 @@ local function onCharacterAdded(player, character)
 	-- re-apply gear on the fresh character: HP cap, walk speed,
 	-- worn visuals and the sword's rarity styling
 	applyGear(player)
+	-- v5: restore the Thorns Aura ring on the new character
+	refreshThornsAura(player)
 	sendMusic(player)
 end
 
@@ -2707,6 +4030,21 @@ local function savePlayer(player)
 			gearData.equipped[slot] = copyItem(item)
 		end
 		data.Gear = gearData
+	end
+	-- v5: class id, skill points, per-class skill levels, thorns toggle
+	local classVal = getStat(player, "Stats", "Class")
+	if classVal then data.Class = classVal.Value end
+	local spVal = getStat(player, "Stats", "SkillPoints")
+	if spVal then data.SkillPoints = spVal.Value end
+	local sState = skillState[player]
+	if sState then
+		local skillsData = {}
+		for _, cid in ipairs(CLASS_IDS) do
+			local arr = sState.skills[cid]
+			skillsData[cid] = { arr[1], arr[2], arr[3] }
+		end
+		data.Skills = skillsData
+		data.ThornsOn = sState.thornsOn
 	end
 	local ok, err = pcall(function()
 		saveStore:SetAsync("player_" .. player.UserId, data)
@@ -2776,6 +4114,29 @@ local function loadPlayer(player)
 			end
 		end
 	end
+	-- v5: class + skill points + per-class skill levels (validated)
+	if type(data.Class) == "string" and CLASS_DEFS[data.Class] then
+		local classVal = getStat(player, "Stats", "Class")
+		if classVal then classVal.Value = data.Class end
+	end
+	apply("Stats", "SkillPoints", data.SkillPoints, 0, 999)
+	local sState = skillState[player]
+	if sState and type(data.Skills) == "table" then
+		for _, cid in ipairs(CLASS_IDS) do
+			local arr = data.Skills[cid]
+			if type(arr) == "table" then
+				for i = 1, 3 do
+					if type(arr[i]) == "number" then
+						sState.skills[cid][i] =
+							math.clamp(math.floor(arr[i]), 0, 5)
+					end
+				end
+			end
+		end
+	end
+	if sState and type(data.ThornsOn) == "boolean" then
+		sState.thornsOn = data.ThornsOn
+	end
 end
 
 local function onPlayerAdded(player)
@@ -2783,6 +4144,11 @@ local function onPlayerAdded(player)
 	gearState[player] = { inv = {}, equipped = {} }
 	bagOpen[player] = false
 	musicMode[player] = "Auto"
+	-- v5 class state (loadPlayer fills skills from the save below)
+	skillState[player] = newSkillState()
+	buffs[player] = nil
+	classPanelOpen[player] = false
+	skillsOpen[player] = false
 
 	local function makeInt(parent, name, value)
 		local v = Instance.new("IntValue")
@@ -2808,6 +4174,11 @@ local function onPlayerAdded(player)
 	makeInt(stats, "Power", 0)
 	makeInt(stats, "GearATK", 0)
 	makeInt(stats, "GearDEF", 0)
+	makeInt(stats, "SkillPoints", 0) -- v5: 1 per level-up
+	local classValue = Instance.new("StringValue") -- v5: "" = no class
+	classValue.Name = "Class"
+	classValue.Value = ""
+	classValue.Parent = stats
 	stats.Parent = player
 
 	-- Load saved progress BEFORE the character setup below reads Level
@@ -2815,12 +4186,22 @@ local function onPlayerAdded(player)
 
 	buildHUD(player)
 	buildBagUI(player)
+	-- v5: class select + skills UI; the select panel opens on join
+	-- for players who have not chosen a class yet
+	buildClassUI(player)
+	classPanelOpen[player] = (getClassId(player) == "")
+	refreshClassUI(player)
 
 	local backpack = player:WaitForChild("Backpack")
-	local startSword = createSword(player)
-	startSword.Parent = backpack
-	createFireballTool(player).Parent = backpack
-	createPotionTool(player).Parent = backpack
+	if getClassId(player) ~= "" then
+		-- returning player with a class: hand out that class's loadout
+		giveClassTools(player)
+	else
+		local startSword = createSword(player)
+		startSword.Parent = backpack
+		createFireballTool(player).Parent = backpack
+		createPotionTool(player).Parent = backpack
+	end
 	-- restored gear (if any) takes effect: bonuses, sword styling,
 	-- worn visuals (character may spawn a moment later; CharacterAdded
 	-- re-applies everything then)
@@ -2850,6 +4231,12 @@ Players.PlayerRemoving:Connect(function(player)
 	sentTrack[player] = nil
 	lastMusicSent[player] = nil
 	toastToken[player] = nil
+	skillState[player] = nil
+	buffs[player] = nil
+	classRefs[player] = nil
+	skillBarRefs[player] = nil
+	classPanelOpen[player] = nil
+	skillsOpen[player] = nil
 end)
 
 game:BindToClose(function()
@@ -2866,8 +4253,11 @@ task.spawn(function()
 		task.wait(0.5)
 		for _, player in ipairs(Players:GetPlayers()) do
 			local mana = getStat(player, "Stats", "Mana")
-			if mana and mana.Value < MAX_MANA then
-				mana.Value = math.min(MAX_MANA, mana.Value + 4)
+			if mana then
+				local cap = maxManaFor(player) -- v5: class mana pool
+				if mana.Value < cap then
+					mana.Value = math.min(cap, mana.Value + 4)
+				end
 			end
 			pcall(updateHUD, player)
 		end
@@ -2927,4 +4317,14 @@ task.spawn(function()
 	end
 end)
 
-print("[ShiningSoul] v4 server started: equipment system + SFX + selectable BGM ready.")
+-- SKILL BAR LOOP (0.2s): cooldown countdown text on the skill bar
+task.spawn(function()
+	while true do
+		task.wait(0.2)
+		for _, player in ipairs(Players:GetPlayers()) do
+			pcall(updateSkillBar, player)
+		end
+	end
+end)
+
+print("[ShiningSoul] v5 server started: four classes (Warrior / Mage / Archer / Paladin) with upgradable skills ready.")

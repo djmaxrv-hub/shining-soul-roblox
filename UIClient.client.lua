@@ -1,14 +1,15 @@
 --====================================================================
--- Shining Soul UI Client -- ONE-TIME SETUP (v4)
+-- Shining Soul UI Client -- ONE-TIME SETUP (v5)
 -- Paste this whole file into ONE LocalScript in StarterPlayerScripts:
 --   Explorer -> StarterPlayerScripts -> + -> LocalScript
 --   (delete the default line, paste this in -- only ever done once)
 --
--- It does two jobs the server script cannot do by itself:
+-- It does three jobs the server script cannot do by itself:
 --   1) Forwards clicks: every GuiButton the server builds carries
 --      "Act" / "Arg" attributes; clicks are sent to the server on
---      the UIEvent RemoteEvent (bag open/close, equip, music...).
---   2) Plays background music: the server says which track to play
+--      the UIEvent RemoteEvent (bag, equip, class, skills, music).
+--   2) Forwards skill hotkeys: Q / E / R cast skills 1 / 2 / 3.
+--   3) Plays background music: the server says which track to play
 --      ("Calm" / "Battle" / "Off") and this script runs one looped
 --      Sound in SoundService.
 --====================================================================
@@ -16,6 +17,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local SoundService = game:GetService("SoundService")
+local UserInputService = game:GetService("UserInputService")
 
 local player = Players.LocalPlayer
 local uiEvent = ReplicatedStorage:WaitForChild("UIEvent")
@@ -70,3 +72,20 @@ for _, descendant in ipairs(playerGui:GetDescendants()) do
 	hookButton(descendant)
 end
 playerGui.DescendantAdded:Connect(hookButton)
+
+-- Skill hotkeys (v5): Q / E / R -> cast skills 1 / 2 / 3.
+-- gameProcessedEvent is true when the keystroke was already used by
+-- the game or a text box (e.g. chatting), so casts never fire while
+-- the player is typing.
+local HOTKEYS = {
+	[Enum.KeyCode.Q] = "1",
+	[Enum.KeyCode.E] = "2",
+	[Enum.KeyCode.R] = "3",
+}
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+	local arg = HOTKEYS[input.KeyCode]
+	if arg then
+		uiEvent:FireServer("CastSkill", arg)
+	end
+end)
